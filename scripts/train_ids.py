@@ -109,4 +109,14 @@ def process_packet(pkt):
 # START SNIFFING
 # =============================
 
-sniff(prn=process_packet, store=False)
+# Show available interfaces
+from scapy.arch.windows import get_windows_if_list
+print("\n📡 Available Interfaces:")
+for i, iface in enumerate(get_windows_if_list()):
+    print(f"  [{i}] {iface['name']} — {iface.get('description', '')}")
+
+# Set your interface name here (copy from above list)
+INTERFACE = None  # e.g., "Ethernet" or "Wi-Fi" — None = auto
+
+print(f"\n🔥 Sniffing on: {'Auto' if INTERFACE is None else INTERFACE} (Promiscuous Mode ON)\n")
+sniff(prn=process_packet, store=False, promisc=True, iface=INTERFACE)

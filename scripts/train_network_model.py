@@ -1,7 +1,15 @@
 import os
+import warnings
 import pandas as pd
 import numpy as np
 import joblib
+
+# Suppress internal sklearn/joblib version mismatch warning (not user code issue)
+warnings.filterwarnings(
+    "ignore",
+    message="`sklearn.utils.parallel.delayed` should be used",
+    category=UserWarning,
+)
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
@@ -206,7 +214,7 @@ model = RandomForestClassifier(
     class_weight="balanced",     # auto: sklearn computes weights from class distribution
     random_state=RANDOM_STATE,
     n_jobs=-1,
-    verbose=1
+    verbose=0
 )
 
 model.fit(X_train, y_train)

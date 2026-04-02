@@ -2,8 +2,13 @@ import os
 import socket
 import sys
 import warnings
-warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
-sys.stdout.reconfigure(line_buffering=True)   # disable output buffering for conda run
+warnings.filterwarnings(
+    "ignore",
+    message="`sklearn.utils.parallel.delayed` should be used",
+    category=UserWarning,
+    module="sklearn"
+)
+sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 import time
 import signal
@@ -32,10 +37,10 @@ sys.unraisablehook = _suppress_scapy_pipe_error
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-MODEL_PATH = os.path.join(BASE_DIR, "models", "network_model.pkl")
+MODEL_PATH  = os.path.join(BASE_DIR, "models", "network_model.pkl")
 SCALER_PATH = os.path.join(BASE_DIR, "models", "scaler.pkl")
 
-model = joblib.load(MODEL_PATH)
+model  = joblib.load(MODEL_PATH)
 scaler = joblib.load(SCALER_PATH)
 
 COLUMN_ORDER = list(scaler.feature_names_in_)
@@ -52,14 +57,14 @@ except Exception:
 def predict_flow(features, meta):
     """Prediction — DataFrame passed to scaler to match training feature names."""
     aligned = {col: float(features.get(col, 0)) for col in COLUMN_ORDER}
-    df = pd.DataFrame([aligned])
-    scaled = scaler.transform(df)   # scaler fitted with feature names, df avoids warning
-    prob = model.predict_proba(scaled)[0][1]
+    df      = pd.DataFrame([aligned])
+    scaled  = scaler.transform(df)
+    prob    = model.predict_proba(scaled)[0][1]
     return prob
 
 
 print("=" * 65)
-print("[NetGuardIDS] Live IDS Started -- Full Network Discovery Mode")
+print("[WiFi-IDS] Live IDS Started — Wi-Fi Packet Analysis Mode")
 print(f"   Model expects {len(COLUMN_ORDER)} features")
 print("=" * 65)
 
@@ -68,34 +73,37 @@ print("=" * 65)
 # =============================
 
 ATTACK_THRESHOLD = 0.40
-FLOW_TIMEOUT = 2        # seconds -- flow will be considered complete after this
-MIN_FLOW_PACKETS = 3    # minimum packets before predicting (avoids single-packet noise)
+FLOW_TIMEOUT     = 2        # seconds — flow considered complete after this
+MIN_FLOW_PACKETS = 3        # minimum packets before predicting (avoids single-packet noise)
 
 # Network Mode:
-# True  --> monitor only this device's packets
-# False --> capture all flows across the entire network
+# True  → monitor only this device's packets
+# False → capture all flows across the entire network (requires ARP spoof)
 DEVICE_ONLY_MODE = False
 
 # Set to a specific NPF GUID to force a particular interface, or leave as None to auto-detect.
-# Auto-detect picks the first Ethernet interface that has an active IP address.
-# This avoids crashes when you change Ethernet ports (Windows assigns a new GUID per port).
-INTERFACE = None   # None = auto-detect active interface
+# Auto-detect picks the first Wi-Fi interface that has an active IP address.
+INTERFACE = None   # None = auto-detect active Wi-Fi interface
 
-# ARP Scan subnet -- used to discover nearby devices
+# ARP Scan subnet — used to discover nearby devices
 # None = auto-detect from interface IP
 ARP_SCAN_SUBNET = None  # e.g. "192.168.1.0/24"
 
-flows = {}
-flows_lock = threading.Lock()   # lock for thread-safe access to flows dict
+flows      = {}
+flows_lock = threading.Lock()
 
-mac_table = {}          # IP -> MAC address mapping
-discovered_ips = {}     # IP -> {mac, first_seen, last_seen, packets}
+mac_table      = {}   # IP -> MAC address mapping
+discovered_ips  = {}  # IP -> {mac, first_seen, last_seen, packets}
+packet_count    = 0   # total packets seen
+dbg_arp_count   = 0   # packets that were ARP
+dbg_ip_count    = 0   # packets with IP layer
+dbg_flow_count  = 0   # IP packets that made it into flow logic
 
 # =============================
 # ASYNC PREDICTION QUEUE
 # =============================
 
-prediction_queue = Queue(maxsize=500)   # queue for completed flows awaiting prediction
+prediction_queue = Queue(maxsize=500)
 
 
 def prediction_worker():
@@ -114,11 +122,11 @@ def prediction_worker():
             attack_prob = predict_flow(features, meta)
 
             src_ip, dst_ip, sport, dport, proto = meta["key"]
-            time_now = datetime.now().strftime("%H:%M:%S")
+            time_now  = datetime.now().strftime("%H:%M:%S")
             proto_name = format_proto(proto)
 
-            src_type = "LAN" if is_private(src_ip) else "WAN"
-            dst_type = "LAN" if is_private(dst_ip) else "WAN"
+            src_type  = "LAN" if is_private(src_ip) else "WAN"
+            dst_type  = "LAN" if is_private(dst_ip) else "WAN"
             direction = f"{src_type}->{dst_type}"
 
             src_mac  = mac_table.get(src_ip) or (gateway_mac if src_ip == gateway_ip else "??:??:??:??:??:??")
@@ -180,7 +188,7 @@ def should_ignore(src_ip, dst_ip):
 def get_key(pkt):
     if IP not in pkt:
         return None
-    ip = pkt[IP]
+    ip    = pkt[IP]
     proto = ip.proto
     if TCP in pkt:
         sport = pkt[TCP].sport
@@ -189,8 +197,6 @@ def get_key(pkt):
         sport = pkt[UDP].sport
         dport = pkt[UDP].dport
     else:
-        # ICMP and other protocols don't have ports
-        # Store ICMP type/code in sport/dport for display purposes
         from scapy.all import ICMP
         if ICMP in pkt:
             sport = pkt[ICMP].type
@@ -216,7 +222,6 @@ _PROTO_NAMES = {
     132: "SCTP",
 }
 
-# ICMP type → human-readable name
 _ICMP_TYPES = {
     0: "Echo Reply",
     3: "Dest Unreachable",
@@ -255,47 +260,17 @@ hostname_cache = {}        # IP -> hostname (resolved asynchronously)
 
 
 def hostname_worker():
-    """Background thread: resolves hostnames without blocking capture.
-
-    Resolution order:
-      1. Reverse DNS  (gethostbyaddr) — works for most routable IPs
-      2. NetBIOS      (nbtstat -A)    — works for Windows LAN machines
-                                        that have no PTR record in DNS
-    """
+    """Background thread: resolves hostnames via reverse DNS without blocking capture."""
     while True:
         try:
             ip = hostname_queue.get(timeout=2)
         except Empty:
             continue
         if ip not in hostname_cache:
-            name = ""
-
-            # ── Method 1: reverse DNS ──
             try:
                 name = socket.gethostbyaddr(str(ip))[0]
             except Exception:
-                pass
-
-            # ── Method 2: NetBIOS (LAN-only, when DNS fails) ──
-            if not name and is_private(ip):
-                try:
-                    import subprocess
-                    result = subprocess.run(
-                        ["nbtstat", "-A", ip],
-                        capture_output=True, text=True,
-                        timeout=6, encoding="utf-8", errors="replace"
-                    )
-                    for line in result.stdout.splitlines():
-                        stripped = line.strip()
-                        # nbtstat output: "HOSTNAME       <00>  UNIQUE  Registered"
-                        if "<00>" in stripped and "UNIQUE" in stripped:
-                            parts = stripped.split()
-                            if parts:
-                                name = parts[0].strip()
-                                break
-                except Exception:
-                    pass
-
+                name = ""
             hostname_cache[ip] = name
         hostname_queue.task_done()
 
@@ -305,16 +280,16 @@ def register_device(ip, mac):
     now = datetime.now().strftime("%H:%M:%S")
     if ip not in discovered_ips:
         discovered_ips[ip] = {
-            "mac": mac,
+            "mac":        mac,
             "first_seen": now,
-            "last_seen": now,
-            "packets": 1
+            "last_seen":  now,
+            "packets":    1
         }
         hostname_queue.put(ip)   # resolve hostname in background
         print(f"  [NEW DEVICE] {ip}  MAC: {mac}  (first seen {now})")
     else:
         discovered_ips[ip]["last_seen"] = now
-        discovered_ips[ip]["packets"] += 1
+        discovered_ips[ip]["packets"]  += 1
         if mac and mac != "??:??:??:??:??:??":
             discovered_ips[ip]["mac"] = mac
 
@@ -334,11 +309,10 @@ def get_local_subnet(iface):
         local_ip = get_if_addr(iface)
         if not local_ip or local_ip == "0.0.0.0":
             return None
-        # assume /24 subnet
-        parts = local_ip.rsplit(".", 1)
+        parts  = local_ip.rsplit(".", 1)
         subnet = parts[0] + ".0/24"
         return subnet, local_ip
-    except Exception as e:
+    except Exception:
         return None
 
 
@@ -346,23 +320,15 @@ def arp_scan(subnet, iface):
     """Send an ARP broadcast — only print newly discovered devices."""
     try:
         arp_req = ARP(pdst=subnet)
-        ether = Ether(dst="ff:ff:ff:ff:ff:ff")
-        packet = ether / arp_req
+        ether   = Ether(dst="ff:ff:ff:ff:ff:ff")
+        packet  = ether / arp_req
 
-        answered, unanswered = srp(packet, iface=iface, timeout=3, verbose=False)
+        answered, _ = srp(packet, iface=iface, timeout=3, verbose=False)
 
-        new_found = []
         for sent, received in answered:
-            ip = received.psrc
+            ip  = received.psrc
             mac = received.hwsrc
-            if ip not in discovered_ips:
-                new_found.append((ip, mac))
-            register_device(ip, mac)   # [NEW DEVICE] is printed inside only for new entries
-
-        # Do not print anything if periodic rescan found nothing new
-        if new_found:
-            pass   # register_device already printed [NEW DEVICE]
-        # else: nothing to print — no need to show the same devices again
+            register_device(ip, mac)
 
         return answered
 
@@ -372,7 +338,7 @@ def arp_scan(subnet, iface):
 
 
 def periodic_arp_scan(subnet, iface, interval=30):
-    """Run ARP scan every few seconds to detect new devices."""
+    """Run ARP scan every N seconds to detect new devices."""
     while True:
         time.sleep(interval)
         arp_scan(subnet, iface)
@@ -382,26 +348,100 @@ def periodic_arp_scan(subnet, iface, interval=30):
 # ARP SPOOFING (MITM — Full Network Capture)
 # =============================
 
-# Whether ARP spoofing is enabled
-ARP_SPOOF_ENABLED = True   # set to False if you only want to monitor your own traffic
+# Note: ARP spoofing over Wi-Fi works the same as Ethernet at L2.
+# The only requirement is that the OS forwards IP packets (IP forwarding).
+ARP_SPOOF_ENABLED = True   # set to False to monitor only your own Wi-Fi traffic
 
-gateway_ip = None    # Router/Gateway IP
-gateway_mac = None   # Router/Gateway MAC
-my_mac = None        # This machine's MAC address
-spoof_active = True  # Controls whether the spoof loop keeps running
+gateway_ip  = None
+gateway_mac = None
+my_mac      = None
+spoof_active = True
 
 
-def get_mac(ip, iface):
-    """Resolve the MAC address of a given IP via ARP."""
+def get_mac(ip, iface, own_mac=None):
+    """
+    Resolve the MAC address of a given IP.
+
+    On Windows Wi-Fi, srp() sometimes returns our own MAC (proxy ARP or
+    Windows Firewall intercepts). We now:
+      - Try the OS ARP cache FIRST (most reliable, already populated)
+      - Validate every result: reject if it equals own_mac
+      - Fall back to srp / sr1 / ping+cache
+
+    own_mac: pass our own MAC so we can detect and skip self-responses.
+    """
+    import subprocess
+
+    own_mac_norm = (own_mac or "").lower().strip()
+
+    def _valid(mac):
+        """Accept MAC only if it looks real and is not our own."""
+        if not mac or len(mac) != 17:
+            return False
+        if own_mac_norm and mac.lower() == own_mac_norm:
+            print(f"[GW MAC] Rejected {mac} — that is our own MAC (proxy-ARP false positive)")
+            return False
+        return True
+
+    # --- Method 1: Windows ARP cache (arp -a) — fastest & most reliable ---
+    def _read_arp_cache(target_ip):
+        try:
+            result = subprocess.run(
+                ["arp", "-a", target_ip],
+                capture_output=True, text=True, timeout=3
+            )
+            for line in result.stdout.splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and parts[0] == target_ip:
+                    mac = parts[1].replace("-", ":").lower()
+                    if _valid(mac):
+                        return mac
+        except Exception:
+            pass
+        return None
+
+    mac = _read_arp_cache(ip)
+    if mac:
+        print(f"[GW MAC] Found in Windows ARP cache: {mac}")
+        return mac
+
+    # --- Method 2: Ping to populate ARP cache, then re-read ---
     try:
-        arp = ARP(pdst=ip)
-        ether = Ether(dst="ff:ff:ff:ff:ff:ff")
-        pkt = ether / arp
-        answered, _ = srp(pkt, iface=iface, timeout=2, verbose=False)
-        if answered:
-            return answered[0][1].hwsrc
+        subprocess.run(
+            ["ping", "-n", "2", "-w", "1000", ip],
+            capture_output=True, timeout=6
+        )
+        mac = _read_arp_cache(ip)
+        if mac:
+            print(f"[GW MAC] Found after ping via ARP cache: {mac}")
+            return mac
     except Exception:
         pass
+
+    # --- Method 3: L2 ARP via srp() ---
+    try:
+        pkt = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip)
+        answered, _ = srp(pkt, iface=iface, timeout=2, verbose=False)
+        if answered:
+            mac = answered[0][1].hwsrc
+            if _valid(mac):
+                print(f"[GW MAC] Found via L2 srp(): {mac}")
+                return mac
+    except Exception:
+        pass
+
+    # --- Method 4: L3 ARP via sr1() ---
+    try:
+        from scapy.all import sr1
+        resp = sr1(ARP(pdst=ip), timeout=2, verbose=False, iface=iface)
+        if resp and ARP in resp:
+            mac = resp[ARP].hwsrc
+            if _valid(mac):
+                print(f"[GW MAC] Found via L3 sr1(): {mac}")
+                return mac
+    except Exception:
+        pass
+
     return None
 
 
@@ -419,10 +459,9 @@ def get_own_mac(iface):
 
 def get_gateway_ip(local_ip):
     """Detect the real gateway IP from the routing table (not hardcoded .1)."""
-    # Method 1: use netifaces if available
     try:
         import netifaces
-        gws = netifaces.gateways()
+        gws        = netifaces.gateways()
         default_gw = gws.get("default", {}).get(netifaces.AF_INET)
         if default_gw:
             return default_gw[0]
@@ -430,7 +469,6 @@ def get_gateway_ip(local_ip):
         pass
     except Exception:
         pass
-    # Method 2: parse 'route print' output on Windows
     try:
         import subprocess
         result = subprocess.run(
@@ -440,10 +478,9 @@ def get_gateway_ip(local_ip):
         for line in result.stdout.splitlines():
             parts = line.split()
             if len(parts) >= 3 and parts[0] == "0.0.0.0" and parts[1] == "0.0.0.0":
-                return parts[2]   # Gateway column
+                return parts[2]
     except Exception:
         pass
-    # Fallback: assume .1
     return local_ip.rsplit(".", 1)[0] + ".1"
 
 
@@ -454,7 +491,7 @@ def spoof_target(target_ip, target_mac, spoof_ip, iface):
     """
     try:
         pkt = Ether(dst=target_mac) / ARP(
-            op=2,           # ARP reply
+            op=2,
             pdst=target_ip,
             hwdst=target_mac,
             psrc=spoof_ip,
@@ -476,7 +513,7 @@ def restore_arp(target_ip, target_mac, real_ip, real_mac, iface):
             hwsrc=real_mac
         )
         sock = conf.L2socket(iface=iface)
-        for _ in range(5):   # send 5 times to ensure delivery
+        for _ in range(5):
             sock.send(pkt)
             time.sleep(0.2)
     except Exception:
@@ -489,10 +526,9 @@ def enable_ip_forwarding():
         import subprocess
         subprocess.run(
             ["netsh", "interface", "ipv4", "set", "interface",
-             "Ethernet", "forwarding=enabled"],
+             "Wi-Fi", "forwarding=enabled"],
             capture_output=True
         )
-        # Also try the registry method
         import winreg
         key = winreg.OpenKey(
             winreg.HKEY_LOCAL_MACHINE,
@@ -501,10 +537,10 @@ def enable_ip_forwarding():
         )
         winreg.SetValueEx(key, "IPEnableRouter", 0, winreg.REG_DWORD, 1)
         winreg.CloseKey(key)
-        print("[*] IP Forwarding: ENABLED")
+        print("[*] IP Forwarding: ENABLED (Wi-Fi)")
     except Exception as e:
         print(f"[!] IP Forwarding could not be enabled: {e}")
-        print("    Run manually: netsh interface ipv4 set interface Ethernet forwarding=enabled")
+        print("    Run manually: netsh interface ipv4 set interface Wi-Fi forwarding=enabled")
 
 
 def disable_ip_forwarding():
@@ -513,7 +549,7 @@ def disable_ip_forwarding():
         import subprocess
         subprocess.run(
             ["netsh", "interface", "ipv4", "set", "interface",
-             "Ethernet", "forwarding=disabled"],
+             "Wi-Fi", "forwarding=disabled"],
             capture_output=True
         )
     except Exception:
@@ -522,15 +558,15 @@ def disable_ip_forwarding():
 
 def arp_spoof_loop(iface):
     """
-    Continuously spoof all devices:
+    Continuously spoof all Wi-Fi clients:
     - Tell every LAN device: 'MAC of the gateway = my MAC'
     - Tell the gateway: 'MAC of every device = my MAC'
-    → All traffic will pass through this machine
+    → All traffic passes through this machine (MITM)
     """
     global spoof_active
     print(f"\n[ARP SPOOF] Started — Gateway: {gateway_ip} ({gateway_mac})")
-    print(f"[ARP SPOOF] My MAC: {my_mac}")
-    print(f"[ARP SPOOF] Spoofing all LAN devices...\n")
+    print(f"[ARP SPOOF] My MAC : {my_mac}")
+    print(f"[ARP SPOOF] Spoofing all Wi-Fi clients...\n")
 
     while spoof_active:
         targets = list(discovered_ips.items())
@@ -538,15 +574,13 @@ def arp_spoof_loop(iface):
             mac = info.get("mac", "")
             if not mac or mac == "??:??:??:??:??:??":
                 continue
-            if ip == gateway_ip or not ip.startswith("192.168."):
+            if ip == gateway_ip or not is_private(ip):
                 continue
-            # Tell the device: MAC of the gateway = my MAC
             spoof_target(ip, mac, gateway_ip, iface)
-            # Tell the gateway: MAC of this device = my MAC
             if gateway_mac:
                 spoof_target(gateway_ip, gateway_mac, ip, iface)
 
-        time.sleep(2)   # refresh spoof every 2 seconds
+        time.sleep(2)
 
 
 def stop_arp_spoof(iface):
@@ -557,7 +591,7 @@ def stop_arp_spoof(iface):
     targets = list(discovered_ips.items())
     for ip, info in targets:
         mac = info.get("mac", "")
-        if not mac or ip == gateway_ip or not ip.startswith("192.168."):
+        if not mac or ip == gateway_ip or not is_private(ip):
             continue
         restore_arp(ip, mac, gateway_ip, gateway_mac, iface)
         if gateway_mac:
@@ -574,44 +608,69 @@ def handle_arp(pkt):
     """Learn IP/MAC mappings from ARP packets."""
     if ARP in pkt:
         arp = pkt[ARP]
-        # Learn IP from both ARP requests and replies
         if arp.psrc and arp.psrc != "0.0.0.0":
             register_device(arp.psrc, arp.hwsrc)
-        if arp.pdst and arp.pdst != "0.0.0.0" and arp.op == 2:  # ARP reply
+        if arp.pdst and arp.pdst != "0.0.0.0" and arp.op == 2:
             register_device(arp.pdst, arp.hwdst)
+
+
+def handle_dot11(pkt):
+    """
+    Learn MAC addresses from 802.11 (Wi-Fi) management/data frames.
+    Dot11 addr2 = transmitter MAC (device sending the frame).
+    This enriches mac_table without needing Ethernet headers.
+    Only useful when the adapter is in monitor mode; in managed mode
+    Scapy presents Ethernet headers so this branch rarely fires.
+    """
+    if Dot11 in pkt and IP in pkt:
+        src_ip = pkt[IP].src
+        if pkt.addr2:   # addr2 = source MAC in Dot11 frames
+            mac_table[src_ip] = pkt.addr2
+            register_device(src_ip, pkt.addr2)
 
 
 def process_packet(pkt):
     """
-    Only collect packet data and update the flow.
+    Collect packet data and update the flow.
     No prediction here — enqueue for the background worker.
     """
-    # Also learn IPs from ARP packets (passive learning)
+    global packet_count, dbg_arp_count, dbg_ip_count, dbg_flow_count
+    packet_count += 1
+
+    # Learn from ARP (passive)
     if ARP in pkt:
+        dbg_arp_count += 1
         handle_arp(pkt)
         return
 
+    # Learn from raw 802.11 data frames (monitor mode only)
+    if Dot11 in pkt and Ether not in pkt:
+        handle_dot11(pkt)
+
     key = get_key(pkt)
     if key is None:
-        return
+        return   # no IP layer — skip
 
+    dbg_ip_count += 1
     src_ip, dst_ip, sport, dport, proto = key
 
     if should_ignore(src_ip, dst_ip):
         return
 
-    # Update MAC + IP mapping from sender only.
-    # With ARP spoofing active, Ether.dst is always OUR MAC (devices send to us).
-    # Using Ether.dst would corrupt the MAC table — all IPs would get our MAC.
-    # Ether.src = real sending device MAC, so only learn from source.
+    # Learn MAC from Ethernet or Dot11 source
     if Ether in pkt:
         mac_table[src_ip] = pkt[Ether].src
         register_device(src_ip, pkt[Ether].src)
-        register_device(dst_ip, "")   # dst MAC unknown at L2 when spoofing
+        register_device(dst_ip, "")
+    elif Dot11 in pkt and pkt.addr2:
+        mac_table[src_ip] = pkt.addr2
+        register_device(src_ip, pkt.addr2)
+        register_device(dst_ip, "")
     else:
         register_device(src_ip, "")
         register_device(dst_ip, "")
 
+    dbg_flow_count += 1
     with flows_lock:
         if key not in flows:
             flows[key] = FlowState(key, pkt)
@@ -627,11 +686,10 @@ def process_packet(pkt):
                 return  # Discard sparse flow silently
 
             features = flow.build_basic_features()
-            meta = {"key": key}
+            meta     = {"key": key}
         else:
-            return  # Flow not yet ready
+            return   # Flow not yet ready
 
-    # Enqueue — prediction_worker will handle it in the background
     if not prediction_queue.full():
         prediction_queue.put((features, meta))
 
@@ -652,9 +710,9 @@ def cleanup_stale_flows():
 
 
 def print_device_summary():
-    """Print a summary of all devices discovered so far."""
+    """Print a summary of all Wi-Fi devices discovered so far."""
     print(f"\n{'='*90}")
-    print(f"[SUMMARY] Total unique devices detected: {len(discovered_ips)}")
+    print(f"[SUMMARY] Total unique Wi-Fi devices detected: {len(discovered_ips)}")
     print(f"  {'IP Address':<18} {'MAC Address':<20} {'Hostname':<30} {'First Seen':<10} Packets")
     print(f"  {'-'*18} {'-'*20} {'-'*30} {'-'*10} -------")
     for ip, info in sorted(discovered_ips.items(),
@@ -665,90 +723,91 @@ def print_device_summary():
 
 
 # =============================
-# INTERFACE SELECTION
+# INTERFACE SELECTION (Wi-Fi First)
 # =============================
 
-def pick_interface():
-    """Auto-detect the physical interface that carries the default route.
+def pick_wifi_interface():
+    """
+    Auto-detect the active Wi-Fi interface.
 
-    Strategy (in order):
-    1. netifaces → find which interface has the default gateway → convert to NPF GUID
-    2. Fallback: first interface with a real routable IP (skip APIPA, loopback, 0.0.0.0)
-    3. Last resort: Scapy default
+    Strategy:
+    1. Scan ALL interfaces — always prefer one with 'wi-fi'/'wireless'/'wlan'
+       in the NPF name AND a real routable IP.
+    2. If none found by name, use netifaces routing table interface.
+    3. Ethernet fallback.
+    4. Last resort: Scapy conf.iface.
 
-    This reliably picks the real Ethernet/Wi-Fi adapter even when VMware,
-    VirtualBox, or Hyper-V virtual adapters are present.
+    Routing table is checked AFTER name scan so that Ethernet as default
+    route does NOT override a connected Wi-Fi adapter.
     """
     if INTERFACE:
         print(f"[*] Using manually set interface: {INTERFACE}")
         return INTERFACE
 
     from scapy.all import get_if_addr
-
     all_ifaces = get_if_list()
 
-    # --- Method 1: netifaces default gateway interface ---
-    # netifaces returns the GUID as '{XXXX-...}' on Windows.
-    # NPF format is '\Device\NPF_{XXXX-...}' — construct directly, most reliable.
-    try:
-        import netifaces
-        gws = netifaces.gateways()
-        default_gw = gws.get("default", {}).get(netifaces.AF_INET)
-        if default_gw:
-            gw_ip = default_gw[0]
-            gw_iface_name = default_gw[1]   # GUID e.g. "{0730DEE1-...}" — Windows returns 2 values
-            # Direct construction of NPF path from GUID
-            npf_iface = f"\\Device\\NPF_{gw_iface_name}"
-            if npf_iface in all_ifaces:
-                ip = get_if_addr(npf_iface)
-                print(f"[*] Auto-selected via routing table : {npf_iface}  (IP: {ip}, GW: {gw_ip})")
-                return npf_iface
-            # Fallback substring match (in case format differs)
-            for iface in all_ifaces:
-                if gw_iface_name.lower() in str(iface).lower():
-                    ip = get_if_addr(iface)
-                    print(f"[*] Auto-selected via routing table : {iface}  (IP: {ip}, GW: {gw_ip})")
-                    return iface
-    except Exception:
-        pass
+    vmware_prefixes = ("192.168.40.", "192.168.80.", "192.168.56.",
+                       "192.168.99.", "10.0.2.", "172.16.0.")
 
-    # --- Method 2: first real routable IP (skip APIPA / loopback / virtual) ---
+    wifi_candidates     = []
     ethernet_candidates = []
-    wifi_candidates = []
+
     for iface in all_ifaces:
         try:
             ip = get_if_addr(iface)
         except Exception:
             continue
-        # Skip loopback, APIPA, unassigned, and common VMware/VirtualBox host-only subnets
-        vmware_prefixes = ("192.168.40.", "192.168.80.", "192.168.56.", "192.168.99.", "10.0.2.", "172.16.0.")
         if (not ip or ip == "0.0.0.0"
                 or ip.startswith("127.")
                 or ip.startswith("169.254.")
                 or any(ip.startswith(p) for p in vmware_prefixes)):
             continue
         iface_lower = str(iface).lower()
-        if "wi-fi" in iface_lower or "wireless" in iface_lower or "wlan" in iface_lower:
+        if any(k in iface_lower for k in ("wi-fi", "wireless", "wlan")):
             wifi_candidates.append((iface, ip))
         else:
             ethernet_candidates.append((iface, ip))
 
-    if ethernet_candidates:
-        chosen, ip = ethernet_candidates[0]
-        print(f"[*] Auto-selected Ethernet interface: {chosen}  (IP: {ip})")
-        return chosen
-
+    # --- PRIORITY 1: Wi-Fi by name (always beats routing table) ---
     if wifi_candidates:
         chosen, ip = wifi_candidates[0]
-        print(f"[*] Auto-selected Wi-Fi interface   : {chosen}  (IP: {ip})")
+        print(f"[*] Auto-selected Wi-Fi interface : {chosen}  (IP: {ip})")
+        return chosen
+
+    # --- PRIORITY 2: netifaces routing table (may return Ethernet) ---
+    try:
+        import netifaces
+        gws        = netifaces.gateways()
+        default_gw = gws.get("default", {}).get(netifaces.AF_INET)
+        if default_gw:
+            gw_ip         = default_gw[0]
+            gw_iface_name = default_gw[1]
+            npf_iface     = f"\\Device\\NPF_{gw_iface_name}"
+            if npf_iface in all_ifaces:
+                ip = get_if_addr(npf_iface)
+                print(f"[!] No Wi-Fi found — using routing table interface: {npf_iface}  (IP: {ip}, GW: {gw_ip})")
+                return npf_iface
+            for iface in all_ifaces:
+                if gw_iface_name.lower() in str(iface).lower():
+                    ip = get_if_addr(iface)
+                    print(f"[!] No Wi-Fi found — using routing table: {iface}  (IP: {ip})")
+                    return iface
+    except Exception:
+        pass
+
+    # --- PRIORITY 3: Any Ethernet ---
+    if ethernet_candidates:
+        chosen, ip = ethernet_candidates[0]
+        print(f"[!] No Wi-Fi interface found — falling back to Ethernet: {chosen}  (IP: {ip})")
         return chosen
 
     # --- Last resort ---
-    print("[!] Could not find an active interface — falling back to Scapy default.")
+    print("[!] Could not find any active interface — falling back to Scapy default.")
     print("    Available interfaces:")
     for iface in all_ifaces:
         print(f"      {iface}")
-    print("    Tip: Set INTERFACE manually at the top of live_ids.py if needed.")
+    print("    Fix: Set INTERFACE manually at the top of live_ids_wifi.py")
     return str(conf.iface)
 
 
@@ -758,9 +817,9 @@ def pick_interface():
 
 if __name__ == "__main__":
 
-    iface = pick_interface()
+    iface = pick_wifi_interface()
 
-    mode_label = "Device-Only" if DEVICE_ONLY_MODE else "Full Ethernet Network"
+    mode_label = "Device-Only" if DEVICE_ONLY_MODE else "Full Wi-Fi Network"
     print(f"[*] Mode        : {mode_label}")
     print(f"[*] Interface   : {iface}")
     print(f"[*] Threshold   : {ATTACK_THRESHOLD}")
@@ -777,9 +836,10 @@ if __name__ == "__main__":
     hostname_thread = threading.Thread(target=hostname_worker, daemon=True)
     hostname_thread.start()
     print("[*] Background hostname resolver started\n")
+
     subnet_info = get_local_subnet(iface)
     if ARP_SCAN_SUBNET:
-        subnet = ARP_SCAN_SUBNET
+        subnet   = ARP_SCAN_SUBNET
         local_ip = "N/A"
     elif subnet_info:
         subnet, local_ip = subnet_info
@@ -794,8 +854,6 @@ if __name__ == "__main__":
     # --- Initial ARP Scan (active discovery) ---
     if subnet:
         arp_scan(subnet, iface)
-
-        # Periodic re-scan thread to detect new devices
         scan_thread = threading.Thread(
             target=periodic_arp_scan,
             args=(subnet, iface, 60),
@@ -807,20 +865,18 @@ if __name__ == "__main__":
     # --- ARP Spoofing Setup ---
     if ARP_SPOOF_ENABLED and subnet_info:
         subnet, local_ip = subnet_info
-
-        # Detect real gateway IP from routing table
         gateway_ip_detected = get_gateway_ip(local_ip)
 
         print(f"[*] Detecting gateway MAC for {gateway_ip_detected}...")
-        gw_mac = get_mac(gateway_ip_detected, iface)
-        my_mac_addr = get_own_mac(iface)   # use interface directly, not ARP on self
+        my_mac_addr  = get_own_mac(iface)          # fetch OUR mac first
         print(f"[*] My MAC address     : {my_mac_addr}")
+        gw_mac = get_mac(gateway_ip_detected, iface, own_mac=my_mac_addr)  # pass own so we reject self-responses
+
 
         if gw_mac and my_mac_addr:
-            # Set global variables
-            globals()["gateway_ip"] = gateway_ip_detected
+            globals()["gateway_ip"]  = gateway_ip_detected
             globals()["gateway_mac"] = gw_mac
-            globals()["my_mac"] = my_mac_addr
+            globals()["my_mac"]      = my_mac_addr
 
             # Register gateway in mac_table so it shows up in logs
             mac_table[gateway_ip_detected] = gw_mac
@@ -842,12 +898,34 @@ if __name__ == "__main__":
     stop_flag = threading.Event()
 
     def handle_exit(sig, frame):
-        print("\n[STOP] Ctrl+C — IDS is shutting down...")
+        print("\n[STOP] Ctrl+C — WiFi-IDS is shutting down...")
         stop_flag.set()
 
     signal.signal(signal.SIGINT, handle_exit)
 
-    print("[*] Starting live packet capture...\n")
+    # --- Packet health-check: print count + breakdown every 10s ---
+    def packet_health_check():
+        last_total = last_arp = last_ip = last_flow = 0
+        while not stop_flag.is_set():
+            time.sleep(10)
+            d_total = packet_count   - last_total
+            d_arp   = dbg_arp_count  - last_arp
+            d_ip    = dbg_ip_count   - last_ip
+            d_flow  = dbg_flow_count - last_flow
+            last_total = packet_count
+            last_arp   = dbg_arp_count
+            last_ip    = dbg_ip_count
+            last_flow  = dbg_flow_count
+            print(
+                f"[Health +{d_total:>4}] "
+                f"Total:{packet_count}  ARP:{d_arp}  IP:{d_ip}  FlowReached:{d_flow} | "
+                f"ActiveFlows:{len(flows)}  Devices:{len(discovered_ips)}"
+            )
+
+    health_thread = threading.Thread(target=packet_health_check, daemon=True)
+    health_thread.start()
+
+    print("[*] Starting live Wi-Fi packet capture...\n")
 
     try:
         conf.use_npcap = True
@@ -856,16 +934,14 @@ if __name__ == "__main__":
                 iface=iface,
                 prn=process_packet,
                 store=False,
-                filter="",
-                promisc=True,
+                filter="",      # capture all: ARP + IP
+                promisc=True,   # promiscuous mode — see all frames on the WLAN
                 timeout=0.5
             )
     except PermissionError:
-        print("[ERROR] Permission denied! Admin/root privileges se chalao:")
-        print("   Windows: Run as Administrator")
-        print("   Linux  : sudo python live_ids.py")
+        print("[ERROR] Permission denied! Run as Administrator:")
+        print("   Windows: Right-click terminal → Run as Administrator")
     finally:
-        # Ctrl+C or any exit — cleanup is guaranteed
         if ARP_SPOOF_ENABLED and gateway_ip:
             stop_arp_spoof(iface)
         cleanup_stale_flows()
