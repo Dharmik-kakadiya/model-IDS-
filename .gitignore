@@ -1,3 +1,42 @@
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env/
+.venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment files
+.env
+.env.local
+secrets.py
+
+# Data and Models
 data/
+models/*.pkl
+
+# PCAP files
+*.pcap
+*.pcapng
+
+# Tests/Debug
+scripts/_test_table.py
+scripts/__table_test.py
+.pytest_cache/
+*.log
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Project specific
+public_readiness_audit.md
+implementation_plan.md
+task.md

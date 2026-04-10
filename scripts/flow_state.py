@@ -78,6 +78,9 @@ class FlowState:
         self.all_pkt_lengths.append(pkt_len)
         self.timestamps.append(now)
 
+        if "IP" not in packet:          # safety guard: should never happen, but just in case
+            return
+
         src_ip = packet["IP"].src
 
         if self.tot_fwd_pkts == 0:

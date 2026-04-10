@@ -17,7 +17,7 @@
   - [live_ids.py](#live_idspy) — मुख्य live IDS (recommended)
   - [network_dashboard.py](#network_dashboardpy) — Visual dashboard
   - [train_network_model.py](#train_network_modelpy) — Model training
-  - [evalute_model.py](#evalute_modelpy) — Model evaluation
+  - [evaluate_model.py](#evalute_modelpy) — Model evaluation
   - [flow_state.py](#flow_statepy) — Flow tracking engine
   - [capture_packets.py](#capture_packetspy) — Legacy capture script
   - [train_ids.py](#train_idspy) — Legacy simple IDS
@@ -119,12 +119,13 @@ ids model/
 │   └── protocol_encoder.pkl    ← (Legacy) protocol के लिए label encoder
 │
 └── scripts/                    ← सभी Python scripts
-    ├── live_ids.py             ← ★ मुख्य: ARP spoof + MITM वाला live IDS
+    ├── live_ids_auto.py        ← ★ मुख्य: Universal multi-interface IDS
+    ├── live_ids.py             ← Legacy Ethernet-only IDS
     ├── live_ids_wifi.py        ← live_ids.py का Wi-Fi version
     ├── network_dashboard.py    ← Rich terminal dashboard (visual mode)
     ├── flow_state.py           ← Flow tracking engine (shared module)
     ├── train_network_model.py  ← Random Forest model train करता है
-    ├── evalute_model.py        ← Model की accuracy + threshold sweep देखता है
+    ├── evaluate_model.py        ← Model की accuracy + threshold sweep देखता है
     ├── capture_packets.py      ← Legacy basic capture script
     ├── train_ids.py            ← Legacy simple IDS (ARP spoof नहीं)
     ├── pcap_to_flow.py         ← PCAP → flow CSV converter
@@ -374,7 +375,7 @@ Settings में `ATTACK_THRESHOLD` वह line है जो `!! ATTACK` औ�
 |---|---|---|
 | **Training** | `train_network_model.py` | CSVs पढ़ता है, features निकालता है, scaler fit करता है, 300-tree forest train करता है, `.pkl` files save करता है |
 | **Inference (Live)** | `live_ids.py` | Startup पर `.pkl` files load करता है, हर completed flow पर `predict_proba()` चलाता है |
-| **Evaluation** | `evalute_model.py` | `.pkl` files load करता है, held-out CSV पर predictions चलाता है, accuracy + threshold sweep दिखाता है |
+| **Evaluation** | `evaluate_model.py` | `.pkl` files load करता है, held-out CSV पर predictions चलाता है, accuracy + threshold sweep दिखाता है |
 
 Model **training time पर frozen हो जाता है**। यह live traffic से नहीं सीखता। इसे बेहतर बनाने के लिए `train_network_model.py` को नए data के साथ फिर से train करें।
 
@@ -417,7 +418,7 @@ Expected output: accuracy report + `model saved successfully!`
 
 ```bash
 # Administrator के रूप में चलाएं!
-python scripts/live_ids.py
+python scripts/live_ids_auto.py
 ```
 
 Output:
@@ -453,7 +454,7 @@ Full-screen Rich table दिखती है जिसमें सभी disco
 ### Model की Performance देखें
 
 ```bash
-python scripts/evalute_model.py
+python scripts/evaluate_model.py
 ```
 
 Accuracy, classification report, confusion matrix, और optimal threshold ढूंढने के लिए threshold sweep table दिखाता है।
@@ -567,7 +568,7 @@ TEST_SIZE       = 0.2         # 20% evaluation के लिए रखें
 
 ---
 
-### `evalute_model.py`
+### `evaluate_model.py`
 
 **Standalone model evaluation।** Saved model को एक held-out dataset पर test करता है और threshold sweep करता है।
 
@@ -584,7 +585,7 @@ TEST_SIZE       = 0.2         # 20% evaluation के लिए रखें
 **Use कैसे करें:**
 
 ```bash
-python scripts/evalute_model.py
+python scripts/evaluate_model.py
 ```
 
 > अलग test CSV use करने के लिए script के ऊपर `DATA_PATH` edit करें। Default है `Thursday-22-02-2018.csv`।
@@ -1134,9 +1135,9 @@ Windows IP forwarding start पर इससे enable होती है:
 | `0.40` | `live_ids.py` का default — ज़्यादा attacks catch होते हैं, थोड़ा noise |
 | `0.20` | Lenient — high recall, ज़्यादा false positives |
 
-अपने data के लिए best threshold देखने के लिए `evalute_model.py` चलाएं:
+अपने data के लिए best threshold देखने के लिए `evaluate_model.py` चलाएं:
 ```bash
-python scripts/evalute_model.py
+python scripts/evaluate_model.py
 ```
 
 Script 0.5 से 0.05 तक thresholds sweep करती है — हर threshold के लिए detection rate, false alarm rate, precision, और F1 score दिखाती है। Best F1 automatically mark होता है।
@@ -1202,10 +1203,10 @@ python scripts/train_network_model.py
 python scripts/train_network_model.py
 
 # Step 2: Model की accuracy check करें (optional)
-python scripts/evalute_model.py
+python scripts/evaluate_model.py
 
 # Step 3a: Live IDS चलाएं — scrolling log output (Admin के रूप में)
-python scripts/live_ids.py
+python scripts/live_ids_auto.py
 
 # Step 3b: Live IDS चलाएं — visual dashboard (Admin के रूप में)
 python scripts/network_dashboard.py

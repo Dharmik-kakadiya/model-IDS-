@@ -1,4 +1,5 @@
 import os
+import sys
 import joblib
 import pandas as pd
 import numpy as np
@@ -10,21 +11,37 @@ from sklearn.metrics import classification_report, confusion_matrix, accuracy_sc
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-MODEL_PATH   = os.path.join(BASE_DIR, "models", "network_model.pkl")
-SCALER_PATH  = os.path.join(BASE_DIR, "models", "scaler.pkl")
+MODEL_PATH    = os.path.join(BASE_DIR, "models", "network_model.pkl")
+SCALER_PATH   = os.path.join(BASE_DIR, "models", "scaler.pkl")
 FEATURES_PATH = os.path.join(BASE_DIR, "models", "features.pkl")
 
-# Use a test file for evaluation
-DATA_PATH = os.path.join(BASE_DIR, "data", "Thursday-22-02-2018.csv")
+# Auto-detect: pehle preferred file dhoondo, phir koi bhi CSV
+_PREFERRED = os.path.join(BASE_DIR, "data", "Thursday-22-02-2018.csv")
+_DATA_DIR  = os.path.join(BASE_DIR, "data")
+
+if os.path.isfile(_PREFERRED):
+    DATA_PATH = _PREFERRED
+elif os.path.isdir(_DATA_DIR):
+    _csvs = sorted(f for f in os.listdir(_DATA_DIR) if f.endswith(".csv"))
+    if _csvs:
+        DATA_PATH = os.path.join(_DATA_DIR, _csvs[0])
+        print(f"[INFO] Preferred CSV not found — using: {_csvs[0]}")
+    else:
+        print("[ERROR] No CSV files found in data/ folder.")
+        print("        Download CICIDS 2017/2018 datasets and put CSVs in data/")
+        sys.exit(1)
+else:
+    print("[ERROR] data/ folder not found. Create it and add CSV datasets.")
+    sys.exit(1)
 
 DROP_COLUMNS = ["Flow ID", "Src IP", "Dst IP", "Timestamp", "Src Port"]
 
 print("Loading model...")
-model  = joblib.load(MODEL_PATH)
-scaler = joblib.load(SCALER_PATH)
+model    = joblib.load(MODEL_PATH)
+scaler   = joblib.load(SCALER_PATH)
 features = joblib.load(FEATURES_PATH)
 
-print("Loading dataset...")
+print(f"Loading dataset: {os.path.basename(DATA_PATH)} ...")
 df = pd.read_csv(DATA_PATH, low_memory=False)
 
 df.columns = df.columns.str.strip()

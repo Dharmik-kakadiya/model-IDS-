@@ -78,7 +78,7 @@ ip_stats       = {}   # { ip: { mac, status, prob, port, proto, direction, last_
 # ARP-discovered devices (full network map)
 discovered     = {}   # { ip: { mac, first_seen, last_seen, status } }
 
-console = Console()
+console = Console(width=None, force_terminal=True)   # auto full-width, no truncation
 
 # =============================
 # UTILITIES
@@ -213,20 +213,21 @@ def build_unified_table():
         show_lines=True,
         header_style="bold cyan",
         title_style="bold white on dark_blue",
-        expand=True,
+        expand=False,          # expand=True columns squeeze karta tha
+        min_width=110,         # minimum table width ensure karo
     )
 
-    t.add_column("#",         style="dim",       width=3,  justify="right")
-    t.add_column("IP Address",                   width=16)
-    t.add_column("MAC",       style="cyan",      width=19)
-    t.add_column("Status",                       width=12, justify="center")
-    t.add_column("Atk %",                        width=8,  justify="center")
-    t.add_column("Port",                         width=7,  justify="center")
-    t.add_column("Proto",                        width=6,  justify="center")
-    t.add_column("Direction",                    width=10, justify="center")
-    t.add_column("Attacks",  style="red bold",   width=7,  justify="center")
-    t.add_column("Flows",    style="dim",        width=6,  justify="center")
-    t.add_column("Last Seen",style="dim",        width=10, justify="center")
+    t.add_column("#",         style="dim",       min_width=3,  justify="right",  no_wrap=True)
+    t.add_column("IP Address",                   min_width=15,                  no_wrap=True)
+    t.add_column("MAC",       style="cyan",      min_width=19,                  no_wrap=True)
+    t.add_column("Status",                       min_width=10, justify="center", no_wrap=True)
+    t.add_column("Atk %",                        min_width=7,  justify="center", no_wrap=True)
+    t.add_column("Port",                         min_width=6,  justify="center", no_wrap=True)
+    t.add_column("Proto",                        min_width=6,  justify="center", no_wrap=True)
+    t.add_column("Direction",                    min_width=10, justify="center", no_wrap=True)
+    t.add_column("Attacks",  style="red bold",   min_width=7,  justify="center", no_wrap=True)
+    t.add_column("Flows",    style="dim",        min_width=6,  justify="center", no_wrap=True)
+    t.add_column("Last Seen",style="dim",        min_width=10, justify="center", no_wrap=True)
 
     # ARP-discovered IPs ko base banao, traffic wale overlay karo
     all_ips = set(discovered.keys()) | set(ip_stats.keys())
@@ -480,8 +481,8 @@ if __name__ == "__main__":
         with Live(
             build_full_dashboard(),
             console=console,
-            refresh_per_second=1 / REFRESH_RATE,
-            screen=True
+            refresh_per_second=REFRESH_RATE,   # fix: pehle 1/REFRESH_RATE tha (inverted)
+            screen=False,                      # screen=True windows terminal pe table hide karta tha
         ) as live:
             while True:
                 time.sleep(REFRESH_RATE)

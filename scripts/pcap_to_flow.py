@@ -1,10 +1,14 @@
+import os
 import pandas as pd
 import numpy as np
 from scapy.all import rdpcap, IP, TCP, UDP
 from collections import defaultdict
 
-PCAP_PATH = "../scripts/benign_traffic.pcap"
-OUTPUT_PATH = "../data/benign_live1.csv"
+BASE_DIR    = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+
+PCAP_PATH   = os.path.join(BASE_DIR, "data", "benign_traffic.pcap")
+OUTPUT_PATH = os.path.join(BASE_DIR, "data", "benign_live1.csv")
 
 print("📂 Reading PCAP...")
 packets = rdpcap(PCAP_PATH)

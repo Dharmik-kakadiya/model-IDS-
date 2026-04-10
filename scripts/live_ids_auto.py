@@ -96,10 +96,11 @@ iface_info   = {}
 spoof_active = True
 
 # Packet counters (updated under counters_lock)
-packet_count   = 0
-dbg_arp_count  = 0
-dbg_ip_count   = 0
-dbg_flow_count = 0
+packet_count      = 0
+dbg_arp_count     = 0
+dbg_ip_count      = 0
+dbg_flow_count    = 0
+dbg_dropped_count = 0   # flows silently dropped when prediction queue is full
 counters_lock  = threading.Lock()
 
 stop_flag = threading.Event()
@@ -112,10 +113,312 @@ prediction_queue = Queue(maxsize=1000)
 hostname_queue   = Queue()
 hostname_cache   = {}   # IP -> hostname string
 
+# Passive DNS cache: IP -> (app_name, domain)
+# Built by sniffing DNS responses from all devices on the network.
+dns_cache      = {}   # IP -> (service_name, domain)
+dns_cache_lock = threading.Lock()
+
+# DHCP hostname cache: IP -> device hostname (from DHCP option 12)
+dhcp_names      = {}   # IP -> hostname string (e.g. "Johns-iPhone")
+dhcp_names_lock = threading.Lock()
+
+# mDNS local name cache: IP -> .local name
+mdns_names      = {}   # IP -> "DeviceName.local"
+mdns_names_lock = threading.Lock()
+
 
 # =============================
-# UTILITIES
+# SERVICE MAP  (domain suffix -> human-readable app name)
+# Used to label traffic from passive DNS sniffing.
 # =============================
+
+_SERVICE_MAP = {
+    # Google / YouTube
+    "youtube.com":       "YouTube",
+    "googlevideo.com":   "YouTube",
+    "ytimg.com":         "YouTube",
+    "youtu.be":          "YouTube",
+    "yt3.ggpht.com":     "YouTube",
+    # Instagram / Facebook / Meta
+    "instagram.com":     "Instagram",
+    "cdninstagram.com":  "Instagram",
+    "facebook.com":      "Facebook",
+    "fbcdn.net":         "Facebook/IG",
+    "fb.com":            "Facebook",
+    "meta.com":          "Meta",
+    # WhatsApp
+    "whatsapp.com":      "WhatsApp",
+    "whatsapp.net":      "WhatsApp",
+    # Google services
+    "gmail.com":         "Gmail",
+    "google.com":        "Google",
+    "googleapis.com":    "Google",
+    "gstatic.com":       "Google",
+    "1e100.net":         "Google CDN",
+    "googleusercontent.com": "Google",
+    "google-analytics.com":  "Google Analytics",
+    # Microsoft
+    "microsoft.com":     "Microsoft",
+    "windows.com":       "Windows Update",
+    "live.com":          "Microsoft",
+    "office.com":        "Microsoft Office",
+    "outlook.com":       "Outlook",
+    "teams.microsoft.com": "MS Teams",
+    # Streaming
+    "netflix.com":       "Netflix",
+    "nflxvideo.net":     "Netflix",
+    "nflxso.net":        "Netflix",
+    "hotstar.com":       "Hotstar",
+    "spotify.com":       "Spotify",
+    "scdn.co":           "Spotify",
+    "prime":             "Amazon Prime",
+    "primevideo.com":    "Amazon Prime",
+    # Social media
+    "twitter.com":       "Twitter/X",
+    "x.com":             "Twitter/X",
+    "twimg.com":         "Twitter/X",
+    "tiktok.com":        "TikTok",
+    "tiktokcdn.com":     "TikTok",
+    "snapchat.com":      "Snapchat",
+    "snap.com":          "Snapchat",
+    "linkedin.com":      "LinkedIn",
+    "telegram.org":      "Telegram",
+    # CDN / Cloud
+    "akamaihd.net":      "Akamai CDN",
+    "akamai.net":        "Akamai CDN",
+    "cloudfront.net":    "AWS CloudFront",
+    "amazonaws.com":     "AWS",
+    "cloudflare.com":    "Cloudflare",
+    "fastly.net":        "Fastly CDN",
+    # App stores
+    "apple.com":         "Apple",
+    "icloud.com":        "iCloud",
+    "mzstatic.com":      "App Store",
+    "play.google.com":   "Play Store",
+    # Gaming
+    "roblox.com":        "Roblox",
+    "epicgames.com":     "Epic Games",
+    "steampowered.com":  "Steam",
+}
+
+
+def _get_service(domain: str):
+    """Return service name if domain matches any entry in _SERVICE_MAP."""
+    d = domain.lower().rstrip(".")
+    for suffix, name in _SERVICE_MAP.items():
+        if d == suffix or d.endswith("." + suffix):
+            return name
+    return None
+
+
+def parse_dns_response(pkt):
+    """
+    Passively sniff DNS responses and build dns_cache:
+        IP -> (service_name, queried_domain)
+
+    Captures traffic from ALL devices on the network (because ARP spoof
+    redirects everything through us). So when someone's phone looks up
+    youtube.com, we see the DNS response and know which IPs = YouTube.
+    """
+    from scapy.all import DNS, DNSRR
+    if UDP not in pkt or DNS not in pkt:
+        return
+    dns = pkt[DNS]
+    if dns.qr != 1 or dns.qdcount < 1:   # only DNS responses
+        return
+    try:
+        qname = dns.qd.qname
+        if isinstance(qname, bytes):
+            qname = qname.decode("utf-8", errors="replace")
+        qname = qname.rstrip(".")
+        service = _get_service(qname)
+        if not service:
+            return
+        # Map every A-record IP in the answer to this service
+        for i in range(dns.ancount):
+            try:
+                rr = dns.an[i]
+                if hasattr(rr, "rdata"):
+                    ip_str = str(rr.rdata)
+                    if ip_str and "." in ip_str:   # valid IPv4
+                        with dns_cache_lock:
+                            dns_cache[ip_str] = (service, qname)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+# =============================
+# OUI VENDOR TABLE  (mobile_scanner equivalent — built-in)
+# =============================
+
+_OUI = {
+    # Apple
+    "00:03:93":"Apple","00:0a:27":"Apple","04:26:65":"Apple","04:db:56":"Apple",
+    "0c:74:c2":"Apple","10:40:f3":"Apple","14:5a:05":"Apple","18:81:0e":"Apple",
+    "1c:36:bb":"Apple","20:78:f0":"Apple","24:a2:e1":"Apple","28:cf:e9":"Apple",
+    "34:08:bc":"Apple","3c:07:54":"Apple","40:30:04":"Apple","44:4c:0c":"Apple",
+    "48:43:7c":"Apple","4c:57:ca":"Apple","54:26:96":"Apple","58:b0:35":"Apple",
+    "5c:f7:e6":"Apple","60:03:08":"Apple","64:20:0c":"Apple","68:64:4b":"Apple",
+    "6c:40:08":"Apple","70:48:0f":"Apple","74:1b:b2":"Apple","74:e1:b6":"Apple",
+    "78:31:c1":"Apple","7c:6d:62":"Apple","8c:7b:9d":"Apple","90:27:e4":"Apple",
+    "94:e9:6a":"Apple","98:01:a7":"Apple","9c:f4:8e":"Apple","a0:99:9b":"Apple",
+    "a4:c3:61":"Apple","ac:0d:1b":"Apple","b4:8b:19":"Apple","b8:ff:61":"Apple",
+    "bc:52:b7":"Apple","c0:63:94":"Apple","c8:2a:14":"Apple","cc:08:8d":"Apple",
+    "d0:03:4b":"Apple","d4:f4:6f":"Apple","dc:2b:2a":"Apple","e0:ac:cb":"Apple",
+    "e4:25:e7":"Apple","e8:8d:28":"Apple","f0:18:98":"Apple","f4:f1:5a":"Apple",
+    "f8:27:93":"Apple","fc:25:3f":"Apple",
+    # Samsung
+    "00:07:ab":"Samsung","04:18:d6":"Samsung","08:08:c2":"Samsung","14:49:e0":"Samsung",
+    "18:22:7e":"Samsung","20:13:e0":"Samsung","24:4b:81":"Samsung","28:27:bf":"Samsung",
+    "38:1f:8d":"Samsung","40:4e:36":"Samsung","44:a7:cf":"Samsung","50:01:bb":"Samsung",
+    "54:40:ad":"Samsung","60:a1:0a":"Samsung","68:eb:ae":"Samsung","70:f9:27":"Samsung",
+    "78:25:ad":"Samsung","84:a4:66":"Samsung","88:36:6c":"Samsung","90:18:7c":"Samsung",
+    "98:52:3d":"Samsung","a0:0b:ba":"Samsung","a4:eb:d3":"Samsung","b4:3a:28":"Samsung",
+    "b8:5e:7b":"Samsung","d0:22:be":"Samsung","d4:88:90":"Samsung","dc:71:96":"Samsung",
+    # Xiaomi/Redmi
+    "04:cf:8c":"Xiaomi","0c:1d:af":"Xiaomi","20:82:c0":"Xiaomi","28:6c:07":"Xiaomi",
+    "34:80:b3":"Xiaomi","40:31:3c":"Xiaomi","4c:63:71":"Xiaomi","58:44:98":"Xiaomi",
+    "64:09:80":"Xiaomi","74:51:ba":"Xiaomi","8c:be:be":"Xiaomi","94:fb:a7":"Xiaomi",
+    "a0:86:c6":"Xiaomi","b0:e2:35":"Xiaomi","c0:ee:fb":"Xiaomi","e4:46:da":"Xiaomi",
+    "f0:b4:29":"Xiaomi","f4:8b:32":"Xiaomi",
+    # OnePlus
+    "04:d3:b5":"OnePlus","20:0f:23":"OnePlus","3c:28:6d":"OnePlus","4c:8b:30":"OnePlus",
+    "64:cc:2e":"OnePlus","8c:8d:28":"OnePlus","a8:9c:ed":"OnePlus",
+    # OPPO / Realme / Vivo
+    "1c:77:f6":"OPPO","28:ba:b5":"OPPO","44:74:6c":"OPPO",
+    "4c:1a:3d":"Realme","54:f6:02":"Realme","68:3e:26":"Realme",
+    "04:03:d6":"Vivo","5c:0a:5b":"Vivo","cc:2d:e0":"Vivo",
+    # Google Pixel
+    "30:fd:38":"Pixel","3c:5a:b4":"Pixel","54:60:09":"Pixel","94:eb:2c":"Pixel",
+    # Huawei
+    "00:18:82":"Huawei","04:f9:38":"Huawei","18:a1:71":"Huawei","28:31:52":"Huawei",
+    "34:6b:d3":"Huawei","40:4d:8e":"Huawei","48:00:31":"Huawei","54:89:98":"Huawei",
+    "70:72:3c":"Huawei","8c:34:fd":"Huawei","ac:e2:15":"Huawei","c8:51:95":"Huawei",
+    # Motorola
+    "00:16:6b":"Motorola","2c:d0:5a":"Motorola","40:78:6a":"Motorola","88:79:7e":"Motorola",
+    # Routers / other
+    "d8:0d:17":"TP-Link","50:d4:f7":"TP-Link","14:cc:20":"TP-Link",
+    "10:bf:48":"D-Link","1c:7e:e5":"D-Link",
+    "00:50:f2":"Microsoft","28:18:78":"Microsoft",
+}
+_MOBILE_VENDORS = {"Apple","Samsung","Xiaomi","OnePlus","OPPO","Realme","Vivo","Pixel","Huawei","Motorola"}
+
+
+def oui_vendor(mac: str) -> str:
+    """Return vendor name from OUI prefix, or empty string."""
+    try:
+        prefix = mac[:8].lower()
+        return _OUI.get(prefix, "")
+    except Exception:
+        return ""
+
+
+# =============================
+# DHCP / mDNS / SSDP HANDLERS
+# (passive sniffing — runs inside the existing sniff loop)
+# =============================
+
+def _handle_dhcp(pkt):
+    """
+    Capture DHCP Discover/Request packets to learn device hostnames.
+    DHCP option 12 = hostname (e.g. "Johns-iPhone", "Galaxy-S23").
+    """
+    from scapy.all import BOOTP, DHCP as _DHCP
+    if _DHCP not in pkt:
+        return
+    try:
+        opts = {o[0]: o[1] for o in pkt[_DHCP].options if isinstance(o, tuple)}
+        msg_type = opts.get("message-type", 0)
+        if msg_type not in (1, 3):   # Discover=1, Request=3
+            return
+        mac = pkt[Ether].src if Ether in pkt else ""
+        if not mac:
+            return
+        name = opts.get("hostname", b"")
+        if isinstance(name, bytes):
+            name = name.decode("utf-8", errors="replace")
+        req_ip = str(opts.get("requested_addr", ""))
+        # Use BOOTP ciaddr (current IP) if no requested_addr
+        if not req_ip or req_ip == "None":
+            if BOOTP in pkt:
+                ciaddr = pkt[BOOTP].ciaddr
+                req_ip = str(ciaddr) if ciaddr and str(ciaddr) != "0.0.0.0" else ""
+        if name and req_ip and req_ip != "0.0.0.0":
+            with dhcp_names_lock:
+                dhcp_names[req_ip] = name
+        # Also register the device so it appears even before it sends traffic
+        if req_ip and req_ip not in ("0.0.0.0", "None", ""):
+            # We'll call register_device if disc_lock is accessible (it is — global)
+            register_device(req_ip, mac, "[DHCP]")
+    except Exception:
+        pass
+
+
+def _handle_mdns(pkt):
+    """
+    Capture mDNS packets to learn device .local names.
+    Apple: "Dharmiks-iPhone.local", Android: "Pixel-7.local"
+    """
+    from scapy.all import DNS as _DNS
+    if IP not in pkt or UDP not in pkt or _DNS not in pkt:
+        return
+    if pkt[UDP].dport != 5353 and pkt[UDP].sport != 5353:
+        return
+    src_ip  = pkt[IP].src
+    src_mac = pkt[Ether].src if Ether in pkt else ""
+    try:
+        dns_layer = pkt[_DNS]
+        # Check answer records
+        for i in range(dns_layer.ancount):
+            try:
+                rr = dns_layer.an[i]
+                if hasattr(rr, "rrname"):
+                    name = rr.rrname
+                    if isinstance(name, bytes):
+                        name = name.decode("utf-8", errors="replace")
+                    name = name.rstrip(".")
+                    if ".local" in name:
+                        # Trim to just the device part, e.g. "Johns-iPhone.local"
+                        local_name = name.split(".")[0] if "." in name else name
+                        with mdns_names_lock:
+                            mdns_names[src_ip] = local_name
+                        if src_mac:
+                            register_device(src_ip, src_mac, "[mDNS]")
+                        return
+            except Exception:
+                pass
+        # Check questions too (device might only query, not answer)
+        for i in range(dns_layer.qdcount):
+            try:
+                qname = dns_layer.qd[i].qname if hasattr(dns_layer.qd, '__getitem__') else dns_layer.qd.qname
+                if isinstance(qname, bytes):
+                    qname = qname.decode("utf-8", errors="replace")
+                if ".local" in qname:
+                    local_name = qname.rstrip(".").split(".")[0]
+                    with mdns_names_lock:
+                        mdns_names[src_ip] = local_name
+                    if src_mac:
+                        register_device(src_ip, src_mac, "[mDNS]")
+                    return
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _handle_ssdp(pkt):
+    """Capture SSDP M-SEARCH/NOTIFY packets — smart TVs, Chromecast, Android."""
+    if IP not in pkt or UDP not in pkt:
+        return
+    if pkt[UDP].dport != 1900 and pkt[UDP].sport != 1900:
+        return
+    src_ip  = pkt[IP].src
+    src_mac = pkt[Ether].src if Ether in pkt else ""
+    if src_ip and is_private(src_ip):
+        register_device(src_ip, src_mac or "", "[SSDP]")
+
 
 def is_private(ip):
     try:
@@ -137,6 +440,10 @@ def should_ignore(src_ip, dst_ip):
         return True
     # In DEVICE_ONLY_MODE skip all LAN↔LAN flows
     if DEVICE_ONLY_MODE and is_private(src_ip) and is_private(dst_ip):
+        return True
+    # Filter VMware / virtual adapter IPs — they're local virtual segments,
+    # not real network devices. Their traffic is just noise in the output.
+    if any(src_ip.startswith(p) for p in VMWARE_PREFIXES):
         return True
     return False
 
@@ -315,21 +622,38 @@ def prediction_worker():
             dst_type  = "LAN" if is_private(dst_ip) else "WAN"
             direction = f"{src_type}->{dst_type}"
 
-            # Resolve gateway MACs from iface_info for display
-            gw_src_mac = next(
-                (i["gateway_mac"] for i in iface_info.values() if i.get("gateway_ip") == src_ip), None
-            )
-            gw_dst_mac = next(
-                (i["gateway_mac"] for i in iface_info.values() if i.get("gateway_ip") == dst_ip), None
-            )
+            # ── MAC + label building ──────────────────────────────────────────
+            # LAN devices: show real MAC (learned via ARP/Ethernet).
+            # Gateway IP : show gateway MAC from iface_info.
+            # WAN IPs    : show app name from dns_cache (YouTube, WhatsApp...)
+            #              or resolved hostname. Never show gateway MAC for WAN.
+            # ─────────────────────────────────────────────────────────────────
+            def _label(ip):
+                host = hostname_cache.get(ip, "")
+                # Check DNS cache for app name (highest priority for display)
+                with dns_cache_lock:
+                    dns_info = dns_cache.get(ip)
+                app_name = dns_info[0] if dns_info else None
 
-            src_mac  = mac_table.get(src_ip) or gw_src_mac or "??:??:??:??:??:??"
-            dst_mac  = mac_table.get(dst_ip) or gw_dst_mac or "??:??:??:??:??:??"
-            src_host = hostname_cache.get(src_ip, "")
-            dst_host = hostname_cache.get(dst_ip, "")
+                # Gateway IP
+                gw_mac = next(
+                    (i["gateway_mac"] for i in iface_info.values()
+                     if i.get("gateway_ip") == ip), None
+                )
+                if gw_mac:
+                    inner = "  ".join(filter(None, [gw_mac, app_name or host]))
+                    return f"{ip} ({inner})"
+                # Private/LAN IP
+                if is_private(ip):
+                    mac   = mac_table.get(ip, "??:??:??:??:??:??")
+                    inner = "  ".join(filter(None, [mac, app_name or host]))
+                    return f"{ip} ({inner})"
+                # WAN IP — show app name > hostname > bare IP
+                display = app_name or host
+                return f"{ip} ({display})" if display else ip
 
-            src_label = f"{src_ip} ({src_mac}{('  ' + src_host) if src_host else ''})"
-            dst_label = f"{dst_ip} ({dst_mac}{('  ' + dst_host) if dst_host else ''})"
+            src_label = _label(src_ip)
+            dst_label = _label(dst_ip)
             port_info = format_port_info(proto, sport, dport)
             tag       = iface_tag_str(iface_lbl)
 
@@ -403,6 +727,31 @@ def make_packet_handler(iface, iface_lbl):
             handle_arp(pkt, iface_lbl)
             return
 
+        # ── DNS: passive app-detection (YouTube, WhatsApp, etc.) ──
+        if UDP in pkt and IP in pkt:
+            if pkt[UDP].sport == 53 or pkt[UDP].dport == 53:
+                parse_dns_response(pkt)
+                return
+
+        # ── DHCP: learn device hostnames (e.g. "Johns-iPhone") ──
+        if UDP in pkt and IP in pkt:
+            sp, dp = pkt[UDP].sport, pkt[UDP].dport
+            if sp in (67, 68) or dp in (67, 68):
+                _handle_dhcp(pkt)
+                return
+
+        # ── mDNS: learn .local device names (Apple / Android) ──
+        if UDP in pkt and IP in pkt:
+            if pkt[UDP].dport == 5353 or pkt[UDP].sport == 5353:
+                _handle_mdns(pkt)
+                # mDNS packets also carry a real IP src — fall through to flow tracking
+
+        # ── SSDP: detect smart TVs / Chromecast / Android ──
+        if UDP in pkt and IP in pkt:
+            if pkt[UDP].dport == 1900 or pkt[UDP].sport == 1900:
+                _handle_ssdp(pkt)
+                return
+
         # ── Dot11 (Wi-Fi monitor mode) — usually Ether headers are present anyway ──
         if Dot11 in pkt and Ether not in pkt and IP in pkt:
             src_ip = pkt[IP].src
@@ -429,17 +778,27 @@ def make_packet_handler(iface, iface_lbl):
         # frames with Ether.src = our_mac for forwarded packets. Sniffing these
         # would associate our_mac with the original device's IP — corrupting
         # the MAC table. Fix: skip MAC learning when src_mac == our own MAC.
+        #
+        # IMPORTANT (MAC bug fix): When a WAN IP (e.g. 1.1.1.1) sends a reply
+        # to our machine, at L2 the frame comes from the GATEWAY (Ether.src =
+        # gateway_mac), not from 1.1.1.1 directly. Registering that MAC as
+        # 1.1.1.1's MAC is WRONG — all internet IPs would get the gateway MAC.
+        # Fix: only learn MAC for private/LAN source IPs.
         own_macs = _get_own_macs()
 
         if Ether in pkt:
             src_mac = pkt[Ether].src
-            if src_mac.lower() not in own_macs:   # skip our own forwarded frames
+            if src_mac.lower() not in own_macs and is_private(src_ip):   # LAN only
                 register_device(src_ip, src_mac, iface_lbl)
+            else:
+                register_device(src_ip, "", iface_lbl)   # WAN — no MAC, just track IP
             register_device(dst_ip, "", iface_lbl)
         elif Dot11 in pkt and pkt.addr2:
             src_mac = pkt.addr2
-            if src_mac.lower() not in own_macs:
+            if src_mac.lower() not in own_macs and is_private(src_ip):
                 register_device(src_ip, src_mac, iface_lbl)
+            else:
+                register_device(src_ip, "", iface_lbl)
             register_device(dst_ip, "", iface_lbl)
         else:
             register_device(src_ip, "", iface_lbl)
@@ -468,6 +827,10 @@ def make_packet_handler(iface, iface_lbl):
 
         if not prediction_queue.full():
             prediction_queue.put((features, meta))
+        else:
+            global dbg_dropped_count
+            with counters_lock:
+                dbg_dropped_count += 1
 
     return process_packet
 
@@ -492,13 +855,12 @@ def cleanup_stale_flows():
 
 def print_device_summary():
     # Column widths
-    W_IP   = 18
-    W_MAC  = 19
-    W_VIA  = 5
-    W_HOST = 30
-    W_FS   = 9    # First Seen
-    W_LS   = 9    # Last Seen
-    BORDER = 2 + W_IP + 1 + W_MAC + 1 + W_VIA + 1 + W_HOST + 1 + W_FS + 1 + W_LS + 1 + 7
+    W_IP     = 18
+    W_MAC    = 19
+    W_VIA    = 5
+    W_VENDOR = 10
+    W_HOST   = 28
+    BORDER = 2 + W_IP + 1 + W_MAC + 1 + W_VIA + 1 + W_VENDOR + 1 + W_HOST + 1 + 9 + 1 + 9 + 1 + 7
 
     # Filter out VMware / virtual adapter IPs from the display
     real_devices = {
@@ -506,31 +868,46 @@ def print_device_summary():
         if not any(ip.startswith(p) for p in VMWARE_PREFIXES)
     }
 
-    print(f"\n{'='*BORDER}")
-    print(f"[SUMMARY] Unique devices across ALL interfaces: {len(real_devices)}")
-    print(
-        f"  {'IP Address':<{W_IP}} {'MAC Address':<{W_MAC}} {'Via':<{W_VIA}} "
-        f"{'Hostname':<{W_HOST}} {'First Seen':<{W_FS}} {'Last Seen':<{W_LS}} Packets"
-    )
-    print(
-        f"  {'-'*W_IP} {'-'*W_MAC} {'-'*W_VIA} "
-        f"{'-'*W_HOST} {'-'*W_FS} {'-'*W_LS} -------"
-    )
-    for ip, info in sorted(real_devices.items(),
-                           key=lambda x: x[1]["packets"], reverse=True):
-        raw_host  = hostname_cache.get(ip, None)
-        if raw_host is None:
-            hostname = "resolving..."
-        elif raw_host == "-":
-            hostname = "N/A"
+    # ── Best hostname: DHCP > mDNS > reverse-DNS > dns_cache app name ──
+    def best_label(ip, info):
+        # 1. DHCP hostname  (device's own chosen name, most reliable)
+        with dhcp_names_lock:
+            dh = dhcp_names.get(ip, "")
+        if dh:
+            return dh
+        # 2. mDNS .local name  (Apple/Android device name)
+        with mdns_names_lock:
+            mn = mdns_names.get(ip, "")
+        if mn:
+            return mn
+        # 3. Reverse DNS (from hostname_worker)
+        rdns = hostname_cache.get(ip)
+        if rdns and rdns not in ("-", ""):
+            return rdns
+        # 4. App name from dns_cache (YouTube, WhatsApp, etc.) — for WAN IPs
+        with dns_cache_lock:
+            di = dns_cache.get(ip)
+        if di:
+            return di[0]   # service name like "YouTube"
+        # 5. Nothing resolved yet
+        if rdns is None:
+            return "resolving..."
+        return "-"
+
+    mobile_devs = []
+    other_devs  = []
+    for ip, info in sorted(real_devices.items(), key=lambda x: x[1]["packets"], reverse=True):
+        vendor = oui_vendor(info.get("mac", ""))
+        entry  = (ip, info, vendor)
+        if vendor in _MOBILE_VENDORS:
+            mobile_devs.append(entry)
         else:
-            hostname = raw_host
-        # Truncate long hostnames so they never break the column alignment
-        if len(hostname) > W_HOST:
-            hostname = hostname[:W_HOST - 2] + ".."
-        itype     = iface_tag_str(info.get("iface", "")).strip("[]").strip()
-        first     = info.get("first_seen", "")
-        last      = info.get("last_seen",  "")
+            other_devs.append(entry)
+
+    def _print_section(title, entries):
+        if not entries:
+            return
+        print(f"\n  ── {title} ({len(entries)}) ──")
         print(
             f"  {ip:<{W_IP}} {info['mac']:<{W_MAC}} {itype:<{W_VIA}} "
             f"{hostname:<{W_HOST}} {first:<{W_FS}} {last:<{W_LS}} {info['packets']}"
@@ -995,17 +1372,18 @@ def health_monitor():
         stop_flag.wait(10)
         if stop_flag.is_set():
             break
-        d_total = packet_count  - last_total
-        d_arp   = dbg_arp_count - last_arp
-        d_ip    = dbg_ip_count  - last_ip
-        d_flow  = dbg_flow_count - last_flow
+        d_total   = packet_count      - last_total
+        d_arp     = dbg_arp_count     - last_arp
+        d_ip      = dbg_ip_count      - last_ip
+        d_flow    = dbg_flow_count    - last_flow
         last_total, last_arp, last_ip, last_flow = (
             packet_count, dbg_arp_count, dbg_ip_count, dbg_flow_count
         )
+        dropped_warn = f"  ⚠ Dropped:{dbg_dropped_count}" if dbg_dropped_count > 0 else ""
         print(
             f"[Health +{d_total:>4}] "
             f"Total:{packet_count}  ARP:{d_arp}  IP:{d_ip}  FlowReached:{d_flow} | "
-            f"ActiveFlows:{len(flows)}  Devices:{len(discovered_ips)}"
+            f"ActiveFlows:{len(flows)}  Devices:{len(discovered_ips)}{dropped_warn}"
         )
 
 
@@ -1029,6 +1407,74 @@ def sniff_on_iface(iface, iface_lbl):
             )
         except Exception:
             pass   # transient error — keep looping
+
+
+# =============================
+# DEVICE SUMMARY TABLE
+# =============================
+
+def print_device_summary():
+    """
+    Ctrl+C ke baad print hone wali summary table.
+    Saare discovered devices, unka MAC, vendor, hostname,
+    aur total packets show karta hai.
+    """
+    print("\n" + "=" * 90)
+    print("  DEVICE SUMMARY — Discovered Devices on Network")
+    print("=" * 90)
+
+    with disc_lock:
+        devices = dict(discovered_ips)
+
+    if not devices:
+        print("  (No devices discovered)")
+        print("=" * 90)
+        return
+
+    # Column headers
+    header = (
+        f"  {'#':<4} {'IP Address':<17} {'MAC':<19} {'Vendor':<12}"
+        f" {'Hostname':<22} {'iface':<8} {'Pkts':>5}  {'First Seen':<10}  {'Last Seen':<10}"
+    )
+    sep = "  " + "-" * 86
+    print(header)
+    print(sep)
+
+    for idx, (ip, info) in enumerate(sorted(devices.items(), key=lambda x: tuple(
+            int(p) for p in x[0].split(".")) if x[0].count(".") == 3 else (999,)), 1):
+
+        mac      = info.get("mac", "??:??:??:??:??:??")
+        first    = info.get("first_seen", "-")
+        last     = info.get("last_seen",  "-")
+        pkts     = info.get("packets",    0)
+        iface_lb = info.get("iface",      "-")
+
+        # Vendor from OUI
+        vendor = oui_vendor(mac)[:11] if mac and mac != "??:??:??:??:??:??" else ""
+
+        # Best hostname: DHCP > mDNS > hostname_cache > "-"
+        with dhcp_names_lock:
+            dname = dhcp_names.get(ip, "")
+        with mdns_names_lock:
+            mname = mdns_names.get(ip, "")
+        hname = hostname_cache.get(ip, "")
+        display_host = (dname or mname or hname or "-")[:21]
+
+        # iface tag
+        tag = iface_tag_str(iface_lb)
+
+        print(
+            f"  {idx:<4} {ip:<17} {mac:<19} {vendor:<12}"
+            f" {display_host:<22} {tag:<8} {pkts:>5}  {first:<10}  {last:<10}"
+        )
+
+    print("=" * 90)
+    print(f"  Total devices : {len(devices)}")
+    total_attacks = sum(
+        1 for ip in devices
+        if hostname_cache.get(ip, "") == ""   # placeholder — no attack data in live_ids_auto
+    )
+    print("=" * 90 + "\n")
 
 
 # =============================

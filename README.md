@@ -17,7 +17,7 @@ A real-time, ML-powered **Network Intrusion Detection System** that monitors you
   - [live_ids.py](#live_idspy) — Main live IDS (recommended)
   - [network_dashboard.py](#network_dashboardpy) — Rich visual dashboard
   - [train_network_model.py](#train_network_modelpy) — Model training
-  - [evalute_model.py](#evalute_modelpy) — Model evaluation
+  - [evaluate_model.py](#evalute_modelpy) — Model evaluation
   - [flow_state.py](#flow_statepy) — Flow tracking engine
   - [capture_packets.py](#capture_packetspy) — Legacy capture script
   - [train_ids.py](#train_idspy) — Legacy simple IDS
@@ -118,12 +118,13 @@ ids model/
 │   └── protocol_encoder.pkl    ← (Legacy) Label encoder for protocol
 │
 └── scripts/                    ← All Python scripts
-    ├── live_ids.py             ← ★ MAIN: Live IDS with ARP spoof + MITM
+    ├── live_ids_auto.py        ← ★ MAIN: Universal multi-interface IDS
+    ├── live_ids.py             ← Legacy Ethernet-only IDS
     ├── live_ids_wifi.py        ← Wi-Fi variant of live_ids.py
     ├── network_dashboard.py    ← Rich terminal dashboard (visual mode)
     ├── flow_state.py           ← Core flow tracking engine (shared module)
     ├── train_network_model.py  ← Train the Random Forest model
-    ├── evalute_model.py        ← Evaluate model accuracy + threshold sweep
+    ├── evaluate_model.py        ← Evaluate model accuracy + threshold sweep
     ├── capture_packets.py      ← Legacy basic capture script
     ├── train_ids.py            ← Legacy simple IDS (no ARP spoof)
     ├── pcap_to_flow.py         ← Convert PCAP→ flow CSV
@@ -370,7 +371,7 @@ The `ATTACK_THRESHOLD` in the settings is the line that separates `!! ATTACK` fr
 |---|---|---|
 | **Training** | `train_network_model.py` | Reads CSVs, extracts features, fits scaler, trains 300-tree forest, saves `.pkl` files |
 | **Inference (Live)** | `live_ids.py` | Loads `.pkl` files at startup, runs `predict_proba()` on each completed flow |
-| **Evaluation** | `evalute_model.py` | Loads `.pkl` files, runs predictions on a held-out CSV, shows accuracy + threshold sweep |
+| **Evaluation** | `evaluate_model.py` | Loads `.pkl` files, runs predictions on a held-out CSV, shows accuracy + threshold sweep |
 
 The model is **frozen at training time**. It does not learn from live traffic. To improve it, retrain `train_network_model.py` with more data.
 
@@ -413,7 +414,7 @@ Expected output: accuracy report + `model saved successfully!`
 
 ```bash
 # Run as Administrator!
-python scripts/live_ids.py
+python scripts/live_ids_auto.py
 ```
 
 Output:
@@ -449,7 +450,7 @@ A full-screen Rich table shows all discovered devices with color-coded attack st
 ### Evaluate Model Performance
 
 ```bash
-python scripts/evalute_model.py
+python scripts/evaluate_model.py
 ```
 
 Outputs accuracy, classification report, confusion matrix, and a threshold sweep table to find the optimal detection threshold.
@@ -563,7 +564,7 @@ TEST_SIZE       = 0.2         # 20% held out for evaluation
 
 ---
 
-### `evalute_model.py`
+### `evaluate_model.py`
 
 **Standalone model evaluation.** Tests a saved model on a held-out dataset and performs a threshold sweep.
 
@@ -580,7 +581,7 @@ TEST_SIZE       = 0.2         # 20% held out for evaluation
 **Usage:**
 
 ```bash
-python scripts/evalute_model.py
+python scripts/evaluate_model.py
 ```
 
 > Edit `DATA_PATH` at the top to point to a different test CSV. Default is `Thursday-22-02-2018.csv`.
@@ -1129,9 +1130,9 @@ The `ATTACK_THRESHOLD` controls the sensitivity of the IDS:
 | `0.40` | Default in `live_ids.py` — catches more attacks, slightly more noise |
 | `0.20` | Lenient — high recall, more false positives |
 
-Run `evalute_model.py` to find the best threshold for your data:
+Run `evaluate_model.py` to find the best threshold for your data:
 ```bash
-python scripts/evalute_model.py
+python scripts/evaluate_model.py
 ```
 
 The script sweeps thresholds from 0.5 down to 0.05, showing detection rate, false alarm rate, precision, and F1 score for each. The best F1 is marked automatically.
@@ -1197,10 +1198,10 @@ python scripts/train_network_model.py
 python scripts/train_network_model.py
 
 # Step 2: Evaluate model accuracy (optional)
-python scripts/evalute_model.py
+python scripts/evaluate_model.py
 
 # Step 3a: Run live IDS — scrolling log output (run as Admin)
-python scripts/live_ids.py
+python scripts/live_ids_auto.py
 
 # Step 3b: Run live IDS — visual dashboard (run as Admin)
 python scripts/network_dashboard.py

