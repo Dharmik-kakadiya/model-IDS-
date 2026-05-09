@@ -64,7 +64,7 @@ print("=" * 70)
 # =============================
 
 ATTACK_THRESHOLD = 0.40
-FLOW_TIMEOUT     = 2        # seconds — flow complete after this idle time
+FLOW_TIMEOUT     = 5        # seconds — flow complete after this idle time
 MIN_FLOW_PACKETS = 3        # minimum packets before model predicts
 
 # False = capture FULL network (all devices via ARP spoof)
@@ -814,7 +814,13 @@ def make_packet_handler(iface, iface_lbl):
             else:
                 flows[key].update(pkt)
 
-            if flows[key].flow_duration() > FLOW_TIMEOUT:
+            flow_finished = False
+            if TCP in pkt:
+                flags = pkt[TCP].flags
+                if flags & 0x01 or flags & 0x04:  # FIN or RST
+                    flow_finished = True
+
+            if flow_finished or flows[key].flow_duration() > FLOW_TIMEOUT:
                 flow = flows.pop(key)
             else:
                 return  # flow not ready yet
@@ -1320,6 +1326,7 @@ def health_monitor():
             f"Total:{packet_count}  ARP:{d_arp}  IP:{d_ip}  FlowReached:{d_flow} | "
             f"ActiveFlows:{len(flows)}  Devices:{len(discovered_ips)}{dropped_warn}"
         )
+        cleanup_stale_flows()
 
 
 # =============================
@@ -1354,62 +1361,85 @@ def print_device_summary():
     Saare discovered devices, unka MAC, vendor, hostname,
     aur total packets show karta hai.
     """
-    print("\n" + "=" * 90)
-    print("  DEVICE SUMMARY — Discovered Devices on Network")
-    print("=" * 90)
-
     with disc_lock:
         devices = dict(discovered_ips)
 
     if not devices:
-        print("  (No devices discovered)")
-        print("=" * 90)
+        print("\n" + "=" * 105)
+        print("  DEVICE SUMMARY — (No devices discovered)")
+        print("=" * 105)
         return
 
-    # Column headers
-    header = (
-        f"  {'#':<4} {'IP Address':<17} {'MAC':<19} {'Vendor':<12}"
-        f" {'Hostname':<22} {'iface':<8} {'Pkts':>5}  {'First Seen':<10}  {'Last Seen':<10}"
-    )
-    sep = "  " + "-" * 86
-    print(header)
-    print(sep)
+    # Split into private (local) and public (external)
+    private_devs = {}
+    public_devs = {}
+    for ip, info in devices.items():
+        if is_private(ip) or is_multicast_or_broadcast(ip):
+            private_devs[ip] = info
+        else:
+            public_devs[ip] = info
 
-    for idx, (ip, info) in enumerate(sorted(devices.items(), key=lambda x: tuple(
-            int(p) for p in x[0].split(".")) if x[0].count(".") == 3 else (999,)), 1):
+    def _print_table(title, dev_dict):
+        print("\n" + "=" * 105)
+        print(f"  {title}")
+        print("=" * 105)
+        if not dev_dict:
+            print("  (No devices in this category)")
+            return
 
-        mac      = info.get("mac", "??:??:??:??:??:??")
-        first    = info.get("first_seen", "-")
-        last     = info.get("last_seen",  "-")
-        pkts     = info.get("packets",    0)
-        iface_lb = info.get("iface",      "-")
-
-        # Vendor from OUI
-        vendor = oui_vendor(mac)[:11] if mac and mac != "??:??:??:??:??:??" else ""
-
-        # Best hostname: DHCP > mDNS > hostname_cache > "-"
-        with dhcp_names_lock:
-            dname = dhcp_names.get(ip, "")
-        with mdns_names_lock:
-            mname = mdns_names.get(ip, "")
-        hname = hostname_cache.get(ip, "")
-        display_host = (dname or mname or hname or "-")[:21]
-
-        # iface tag
-        tag = iface_tag_str(iface_lb)
-
-        print(
-            f"  {idx:<4} {ip:<17} {mac:<19} {vendor:<12}"
-            f" {display_host:<22} {tag:<8} {pkts:>5}  {first:<10}  {last:<10}"
+        header = (
+            f"  {'#':<4} {'IP Address':<17} {'MAC':<19} {'Vendor':<12}"
+            f" {'Hostname / App':<25} {'iface':<8} {'Pkts':>5}  {'First Seen':<10}  {'Last Seen':<10}"
         )
+        sep = "  " + "-" * 101
+        print(header)
+        print(sep)
 
-    print("=" * 90)
-    print(f"  Total devices : {len(devices)}")
-    total_attacks = sum(
-        1 for ip in devices
-        if hostname_cache.get(ip, "") == ""   # placeholder — no attack data in live_ids_auto
-    )
-    print("=" * 90 + "\n")
+        for idx, (ip, info) in enumerate(sorted(dev_dict.items(), key=lambda x: tuple(
+                int(p) for p in x[0].split(".")) if x[0].count(".") == 3 else (999,)), 1):
+
+            mac      = info.get("mac", "??:??:??:??:??:??")
+            first    = info.get("first_seen", "-")
+            last     = info.get("last_seen",  "-")
+            pkts     = info.get("packets",    0)
+            iface_lb = info.get("iface",      "-")
+
+            vendor = oui_vendor(mac)[:11] if mac and mac != "??:??:??:??:??:??" else ""
+
+            # Resolve App name / Hostname
+            display_host = "-"
+            if not is_private(ip) and not is_multicast_or_broadcast(ip):
+                # Public IP: Show App Name from DNS Cache
+                with dns_cache_lock:
+                    dns_info = dns_cache.get(ip)
+                if dns_info:
+                    display_host = dns_info[0] # The service name (e.g. YouTube, Instagram)
+                else:
+                    display_host = hostname_cache.get(ip, "")
+            else:
+                # Private IP: Show Hostname
+                with dhcp_names_lock:
+                    dname = dhcp_names.get(ip, "")
+                with mdns_names_lock:
+                    mname = mdns_names.get(ip, "")
+                hname = hostname_cache.get(ip, "")
+                display_host = dname or mname or hname or "-"
+
+            display_host = display_host[:24]
+            tag = iface_tag_str(iface_lb)
+
+            print(
+                f"  {idx:<4} {ip:<17} {mac:<19} {vendor:<12}"
+                f" {display_host:<25} {tag:<8} {pkts:>5}  {first:<10}  {last:<10}"
+            )
+        print("-" * 105)
+        print(f"  Total devices : {len(dev_dict)}")
+
+    # Print both tables
+    _print_table("PRIVATE DEVICES (Local Network) — Computers, Phones, Routers", private_devs)
+    _print_table("PUBLIC DEVICES (External / Internet) — Web Servers, Cloud, Apps", public_devs)
+
+    print("=" * 105 + "\n")
 
 
 # =============================

@@ -133,7 +133,12 @@ for file in sorted(os.listdir(DATA_DIR)):
 
     # sample rows to keep memory manageable
     if len(df) > SAMPLE_PER_FILE:
-        df = df.sample(SAMPLE_PER_FILE, random_state=RANDOM_STATE)
+        try:
+            # Use stratified sampling to preserve minor attack classes
+            weights = df.groupby("Label")["Label"].transform("count") / len(df)
+            df = df.sample(SAMPLE_PER_FILE, weights=1/weights, random_state=RANDOM_STATE)
+        except Exception:
+            df = df.sample(SAMPLE_PER_FILE, random_state=RANDOM_STATE)
 
     all_chunks.append(df)
     print(f"    Sampled {len(df)} rows | Benign: {(df['Label'].str.upper()=='BENIGN').sum()} | Attack: {(df['Label'].str.upper()!='BENIGN').sum()}")

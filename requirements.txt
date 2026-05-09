@@ -4,4 +4,4 @@ pandas
 numpy
 scikit-learn
 rich
-netifaces
+netifaces2      # replaces netifaces for Python 3.12+

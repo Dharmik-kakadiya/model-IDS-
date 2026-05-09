@@ -179,7 +179,7 @@ class FlowState:
 
             "Dst Port": self.dst_port,
             "Protocol": self.protocol,
-            "Flow Duration": duration,
+            "Flow Duration": duration * 1e6,
 
             "Tot Fwd Pkts": self.tot_fwd_pkts,
             "Tot Bwd Pkts": self.tot_bwd_pkts,
@@ -230,22 +230,22 @@ class FlowState:
             "Fwd Pkts/s": self.tot_fwd_pkts / duration,
             "Bwd Pkts/s": self.tot_bwd_pkts / duration,
 
-            "Flow IAT Mean": flow_iat_mean,
-            "Flow IAT Std": flow_iat_std,
-            "Flow IAT Max": flow_iat_max,
-            "Flow IAT Min": flow_iat_min,
+            "Flow IAT Mean": flow_iat_mean * 1e6,
+            "Flow IAT Std": flow_iat_std * 1e6,
+            "Flow IAT Max": flow_iat_max * 1e6,
+            "Flow IAT Min": flow_iat_min * 1e6,
 
-            "Fwd IAT Tot": fwd_iat_tot,
-            "Fwd IAT Mean": fwd_iat_mean,
-            "Fwd IAT Std": fwd_iat_std,
-            "Fwd IAT Max": fwd_iat_max,
-            "Fwd IAT Min": fwd_iat_min,
+            "Fwd IAT Tot": fwd_iat_tot * 1e6,
+            "Fwd IAT Mean": fwd_iat_mean * 1e6,
+            "Fwd IAT Std": fwd_iat_std * 1e6,
+            "Fwd IAT Max": fwd_iat_max * 1e6,
+            "Fwd IAT Min": fwd_iat_min * 1e6,
 
-            "Bwd IAT Tot": bwd_iat_tot,
-            "Bwd IAT Mean": bwd_iat_mean,
-            "Bwd IAT Std": bwd_iat_std,
-            "Bwd IAT Max": bwd_iat_max,
-            "Bwd IAT Min": bwd_iat_min,
+            "Bwd IAT Tot": bwd_iat_tot * 1e6,
+            "Bwd IAT Mean": bwd_iat_mean * 1e6,
+            "Bwd IAT Std": bwd_iat_std * 1e6,
+            "Bwd IAT Max": bwd_iat_max * 1e6,
+            "Bwd IAT Min": bwd_iat_min * 1e6,
 
             "FIN Flag Cnt": self.fin_flag_cnt,
             "SYN Flag Cnt": self.syn_flag_cnt,
@@ -261,15 +261,15 @@ class FlowState:
             "Subflow Bwd Pkts": self.tot_bwd_pkts,
             "Subflow Bwd Byts": self.totlen_bwd_pkts,
 
-            "Active Mean": active_mean,
-            "Active Std": active_std,
-            "Active Max": active_max,
-            "Active Min": active_min,
+            "Active Mean": active_mean * 1e6,
+            "Active Std": active_std * 1e6,
+            "Active Max": active_max * 1e6,
+            "Active Min": active_min * 1e6,
 
-            "Idle Mean": idle_mean,
-            "Idle Std": idle_std,
-            "Idle Max": idle_max,
-            "Idle Min": idle_min,
+            "Idle Mean": idle_mean * 1e6,
+            "Idle Std": idle_std * 1e6,
+            "Idle Max": idle_max * 1e6,
+            "Idle Min": idle_min * 1e6,
         }
 
         return features
