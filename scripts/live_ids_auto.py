@@ -78,7 +78,8 @@ VMWARE_PREFIXES = (
 )
 
 # ARP Spoofing — forces ALL LAN traffic through this machine
-ARP_SPOOF_ENABLED = True
+# WARNING: Keep this False on large/public networks to prevent DoS!
+ARP_SPOOF_ENABLED = False
 
 # =============================
 # SHARED STATE
