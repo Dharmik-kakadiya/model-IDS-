@@ -659,17 +659,19 @@ def prediction_worker():
             tag       = iface_tag_str(iface_lbl)
 
             if attack_prob > ATTACK_THRESHOLD:
-                print(
-                    f"[{time_now}] !! ATTACK  ({attack_prob:.2f}) {tag} | "
-                    f"{src_label} -> {dst_label} | "
-                    f"{port_info} | {proto_name} | {direction}"
-                )
+                log_line = (f"[{time_now}] !! ATTACK  ({attack_prob:.2f}) {tag} | "
+                            f"{src_label} -> {dst_label} | "
+                            f"{port_info} | {proto_name} | {direction}")
             else:
-                print(
-                    f"[{time_now}]    BENIGN  ({attack_prob:.2f}) {tag} | "
-                    f"{src_label} -> {dst_label} | "
-                    f"{port_info} | {proto_name} | {direction}"
-                )
+                log_line = (f"[{time_now}]    BENIGN  ({attack_prob:.2f}) {tag} | "
+                            f"{src_label} -> {dst_label} | "
+                            f"{port_info} | {proto_name} | {direction}")
+            print(log_line)
+            try:
+                with open("ids_alerts.log", "a", encoding="utf-8") as f:
+                    f.write(log_line + "\n")
+            except Exception:
+                pass
         except Exception as e:
             print(f"[Prediction Error] {e}")
 
