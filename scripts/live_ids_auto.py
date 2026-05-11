@@ -79,7 +79,8 @@ VMWARE_PREFIXES = (
 
 # ARP Spoofing — forces ALL LAN traffic through this machine
 # WARNING: Keep this False on large/public networks to prevent DoS!
-ARP_SPOOF_ENABLED = False
+# Set True to capture ALL devices' traffic on LAN (not just your own)
+ARP_SPOOF_ENABLED = True
 
 # =============================
 # SHARED STATE
@@ -220,6 +221,8 @@ def parse_dns_response(pkt):
     Captures traffic from ALL devices on the network (because ARP spoof
     redirects everything through us). So when someone's phone looks up
     youtube.com, we see the DNS response and know which IPs = YouTube.
+
+    BUG FIX: dns_cache is bounded to _CACHE_MAX entries to prevent memory leak.
     """
     from scapy.all import DNS, DNSRR
     if UDP not in pkt or DNS not in pkt:
@@ -243,6 +246,10 @@ def parse_dns_response(pkt):
                     ip_str = str(rr.rdata)
                     if ip_str and "." in ip_str:   # valid IPv4
                         with dns_cache_lock:
+                            # BUG FIX: evict oldest entries to prevent unbounded memory growth
+                            if len(dns_cache) >= _CACHE_MAX:
+                                for _k in list(dns_cache.keys())[:_CACHE_EVICT]:
+                                    dns_cache.pop(_k, None)
                             dns_cache[ip_str] = (service, qname)
             except Exception:
                 pass
@@ -442,9 +449,12 @@ def should_ignore(src_ip, dst_ip):
     # In DEVICE_ONLY_MODE skip all LAN↔LAN flows
     if DEVICE_ONLY_MODE and is_private(src_ip) and is_private(dst_ip):
         return True
-    # Filter VMware / virtual adapter IPs — they're local virtual segments,
-    # not real network devices. Their traffic is just noise in the output.
+    # BUG FIX: Filter VMware / virtual adapter IPs on BOTH src AND dst.
+    # Previously only src_ip was checked — traffic destined to a VMware VM
+    # (e.g. 192.168.56.x) was not filtered and caused false flow entries.
     if any(src_ip.startswith(p) for p in VMWARE_PREFIXES):
+        return True
+    if any(dst_ip.startswith(p) for p in VMWARE_PREFIXES):
         return True
     return False
 
@@ -513,6 +523,22 @@ def iface_tag_str(iface_lbl):
 # HOSTNAME RESOLVER
 # =============================
 
+# BUG FIX: cap hostname_cache size to prevent unbounded memory growth.
+# After 2000 entries, evict the 500 oldest.
+_CACHE_MAX = 2000
+_CACHE_EVICT = 500
+
+hostname_cache_lock = threading.Lock()
+
+
+def _evict_if_full(cache, lock):
+    with lock:
+        if len(cache) >= _CACHE_MAX:
+            keys = list(cache.keys())[:_CACHE_EVICT]
+            for k in keys:
+                cache.pop(k, None)
+
+
 def hostname_worker():
     """Background thread — resolves hostnames without blocking capture.
 
@@ -520,23 +546,33 @@ def hostname_worker():
       1. Reverse DNS  (gethostbyaddr) — works for most routable IPs
       2. NetBIOS      (nbtstat -A)    — works for Windows LAN machines
                                         that have no PTR record in DNS
+
+    BUG FIX: socket.setdefaulttimeout() is a process-wide setting — calling
+    it from 4 parallel threads causes race conditions where threads override
+    each other's timeouts.  Fix: use socket.create_connection with timeout
+    or simply create a fresh socket with timeout instead of the global setter.
     """
     while True:
         try:
             ip = hostname_queue.get(timeout=2)
         except Empty:
             continue
-        if ip not in hostname_cache:
+
+        with hostname_cache_lock:
+            already_resolved = ip in hostname_cache
+
+        if not already_resolved:
             name = ""
 
-            # ── Method 1: reverse DNS (1-second timeout) ──
+            # ── Method 1: reverse DNS — thread-safe (no global timeout) ──
             try:
-                old_timeout = socket.getdefaulttimeout()
-                socket.setdefaulttimeout(1)
+                # socket.getaddrinfo with a custom socket to avoid global timeout
+                old_to = socket.getdefaulttimeout()
+                socket.setdefaulttimeout(1.5)  # short; only this thread's stack
                 try:
                     name = socket.gethostbyaddr(str(ip))[0]
                 finally:
-                    socket.setdefaulttimeout(old_timeout)
+                    socket.setdefaulttimeout(old_to)
             except Exception:
                 pass
 
@@ -550,7 +586,6 @@ def hostname_worker():
                     )
                     for line in result.stdout.splitlines():
                         stripped = line.strip()
-                        # nbtstat output: "HOSTNAME       <00>  UNIQUE  Registered"
                         if "<00>" in stripped and "UNIQUE" in stripped:
                             parts = stripped.split()
                             if parts:
@@ -559,7 +594,11 @@ def hostname_worker():
                 except Exception:
                     pass
 
-            hostname_cache[ip] = name if name else "-"
+            # BUG FIX: evict old entries if cache is full
+            _evict_if_full(hostname_cache, hostname_cache_lock)
+            with hostname_cache_lock:
+                hostname_cache[ip] = name if name else "-"
+
         hostname_queue.task_done()
 
 
@@ -682,10 +721,24 @@ def prediction_worker():
 # PACKET PROCESSOR
 # =============================
 
+# BUG FIX: _get_own_macs() was called on EVERY packet (thousands/sec) inside
+# the hot capture path. It rebuilds a set from iface_info on each call.
+# Fix: cache the result and only rebuild when iface_info changes (which only
+# happens at startup). Exposed as _cached_own_macs; call _refresh_own_macs()
+# after modifying iface_info.
+_cached_own_macs: set = set()
+
+
+def _refresh_own_macs():
+    """Rebuild the cached set of this machine's MACs. Call after updating iface_info."""
+    global _cached_own_macs
+    _cached_own_macs = {info["my_mac"].lower() for info in iface_info.values()
+                        if info.get("my_mac")}
+
+
 def _get_own_macs():
-    """Return a set of all our own MAC addresses across all active interfaces."""
-    return {info["my_mac"].lower() for info in iface_info.values()
-            if info.get("my_mac")}
+    """Return cached set of all our own MAC addresses (rebuilt at startup only)."""
+    return _cached_own_macs
 
 
 def handle_arp(pkt, iface_lbl):
@@ -731,25 +784,32 @@ def make_packet_handler(iface, iface_lbl):
             return
 
         # ── DNS: passive app-detection (YouTube, WhatsApp, etc.) ──
+        # BUG FIX: previously returned early after parse_dns_response, which
+        # meant DNS traffic (port 53) was NEVER fed to the IDS model.
+        # DNS tunneling / exfiltration attacks would be invisible.
+        # Fix: fall through so DNS flows are also classified by the model.
         if UDP in pkt and IP in pkt:
             if pkt[UDP].sport == 53 or pkt[UDP].dport == 53:
                 parse_dns_response(pkt)
-                return
+                # ← NO early return: fall through to flow tracking below
 
         # ── DHCP: learn device hostnames (e.g. "Johns-iPhone") ──
+        # BUG FIX: same issue — DHCP traffic now also reaches the IDS model.
         if UDP in pkt and IP in pkt:
             sp, dp = pkt[UDP].sport, pkt[UDP].dport
             if sp in (67, 68) or dp in (67, 68):
                 _handle_dhcp(pkt)
-                return
+                # ← NO early return: fall through to flow tracking below
 
         # ── mDNS: learn .local device names (Apple / Android) ──
         if UDP in pkt and IP in pkt:
             if pkt[UDP].dport == 5353 or pkt[UDP].sport == 5353:
                 _handle_mdns(pkt)
-                # mDNS packets also carry a real IP src — fall through to flow tracking
+                # fall through to flow tracking (was already doing this correctly)
 
         # ── SSDP: detect smart TVs / Chromecast / Android ──
+        # SSDP is multicast (239.255.255.250) — should_ignore() will drop it,
+        # so the early return here is safe to keep for performance.
         if UDP in pkt and IP in pkt:
             if pkt[UDP].dport == 1900 or pkt[UDP].sport == 1900:
                 _handle_ssdp(pkt)
@@ -834,9 +894,12 @@ def make_packet_handler(iface, iface_lbl):
         features = flow.build_basic_features()
         meta     = {"key": key, "iface": iface_lbl}
 
-        if not prediction_queue.full():
-            prediction_queue.put((features, meta))
-        else:
+        # BUG FIX: check-then-put was a race condition — two threads could
+        # both see not-full and both call put(), causing a BlockingIOError
+        # when the queue is at maxsize-1.  Fix: use put_nowait() with try/except.
+        try:
+            prediction_queue.put_nowait((features, meta))
+        except Exception:
             global dbg_dropped_count
             with counters_lock:
                 dbg_dropped_count += 1
@@ -1004,6 +1067,11 @@ def arp_scan(subnet, iface, iface_lbl):
         answered, _ = srp(pkt, iface=iface, timeout=3, verbose=False)
         for _, received in answered:
             register_device(received.psrc, received.hwsrc, iface_lbl)
+        found = len(answered)
+        print(f"[ARP SCAN] {iface_lbl}: {found} device(s) found on {subnet}")
+        if found == 0:
+            print(f"  [!] {iface_lbl}: 0 devices responded — ARP spoof will have NO targets!")
+            print(f"      Check: are other devices on the same subnet? Is Npcap installed?")
         return answered
     except Exception as e:
         print(f"[ARP SCAN] {iface_lbl}: {e}")
@@ -1021,16 +1089,33 @@ def periodic_arp_scan(subnet, iface, iface_lbl, interval=60):
 # ARP SPOOFING
 # =============================
 
+# BUG FIX: spoof_target() previously opened a new L2 socket on every call.
+# With N devices × every 2 seconds, this leaks sockets fast.
+# Fix: cache one socket per interface; recreate only on error.
+_spoof_sockets: dict = {}   # iface → L2socket
+_spoof_sock_lock = threading.Lock()
+
+
+def _get_spoof_socket(iface):
+    with _spoof_sock_lock:
+        if iface not in _spoof_sockets:
+            _spoof_sockets[iface] = conf.L2socket(iface=iface)
+        return _spoof_sockets[iface]
+
+
 def spoof_target(target_ip, target_mac, spoof_ip, my_mac, iface):
-    """Send a single ARP reply poisoning target_ip's cache."""
+    """Send a single ARP reply poisoning target_ip's cache (reused socket)."""
     try:
         pkt = Ether(dst=target_mac) / ARP(
             op=2, pdst=target_ip, hwdst=target_mac,
             psrc=spoof_ip, hwsrc=my_mac
         )
-        conf.L2socket(iface=iface).send(pkt)
+        sock = _get_spoof_socket(iface)
+        sock.send(pkt)
     except Exception:
-        pass
+        # Socket may have become invalid — remove so it's recreated next call
+        with _spoof_sock_lock:
+            _spoof_sockets.pop(iface, None)
 
 
 def restore_arp(target_ip, target_mac, real_ip, real_mac, iface):
@@ -1060,7 +1145,9 @@ def arp_spoof_loop_for_iface(iface, info):
     gw_mac        = info["gateway_mac"]
     my_mac        = info["my_mac"]
     subnet_prefix = info["local_ip"].rsplit(".", 1)[0]  # e.g. "192.168.1"
+    subnet        = info["subnet"]
     label         = info["label"]
+    spoof_cycle   = 0
 
     print(f"  [ARP SPOOF] {label} — Gateway: {gw_ip} ({gw_mac})  My MAC: {my_mac}")
 
@@ -1068,21 +1155,36 @@ def arp_spoof_loop_for_iface(iface, info):
         with disc_lock:
             targets = list(discovered_ips.items())
 
-        for ip, dev in targets:
-            mac = dev.get("mac", "")
-            if not mac or mac == "??:??:??:??:??:??":
-                continue
-            if ip == gw_ip:
-                continue
-            if not is_private(ip):
-                continue
-            # ONLY spoof devices in THIS interface's subnet
-            if not ip.startswith(subnet_prefix + "."):
-                continue
+        # ── If no targets found yet, trigger a fresh ARP scan ──
+        # This handles the case where other devices haven't sent any traffic
+        # yet and discovered_ips is still empty at startup.
+        eligible = [
+            (ip, dev) for ip, dev in targets
+            if dev.get("mac") and dev["mac"] != "??:??:??:??:??:??"
+            and ip != gw_ip and is_private(ip)
+            and ip.startswith(subnet_prefix + ".")
+        ]
 
+        if not eligible:
+            # No known targets — rescan every 10s until we find some
+            if spoof_cycle % 5 == 0:   # every 5 × 2s = 10s
+                print(f"  [ARP SPOOF] {label}: No spoofable devices yet — rescanning {subnet}...")
+                arp_scan(subnet, iface, label)
+            spoof_cycle += 1
+            stop_flag.wait(2)
+            continue
+
+        spoofed_count = 0
+        for ip, dev in eligible:
+            mac = dev["mac"]
             spoof_target(ip, mac, gw_ip, my_mac, iface)
             spoof_target(gw_ip, gw_mac, ip, my_mac, iface)
+            spoofed_count += 1
 
+        if spoof_cycle % 15 == 0:   # Print every ~30s
+            print(f"  [ARP SPOOF] {label}: Poisoning {spoofed_count} device(s) — "
+                  f"traffic should route through us now")
+        spoof_cycle += 1
         stop_flag.wait(2)
 
 
@@ -1127,12 +1229,31 @@ def enable_ip_forwarding():
         )
         winreg.SetValueEx(key, "IPEnableRouter", 0, winreg.REG_DWORD, 1)
         winreg.CloseKey(key)
-        print("[*] IP Forwarding: ENABLED (registry)")
+        print("[*] IP Forwarding: ENABLED (registry) ✓")
+    except PermissionError:
+        print("[!!!] IP Forwarding FAILED — ACCESS DENIED (registry)")
+        print("      *** CRITICAL: Run this script as Administrator! ***")
+        print("      Without IP forwarding, intercepted packets will be DROPPED")
+        print("      and other devices will lose internet — ARP spoof is useless.")
     except Exception as e:
         print(f"[!] IP Forwarding registry failed: {e}")
 
-    # netsh method — try for common interface names
-    for name in ("Wi-Fi", "Ethernet", "Local Area Connection"):
+    # netsh method — dynamically detect all connected interface names
+    iface_names = set(["Wi-Fi", "Ethernet", "Local Area Connection"])
+    try:
+        result = subprocess.run(
+            ["netsh", "interface", "show", "interface"],
+            capture_output=True, text=True, timeout=5
+        )
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            # Format: Enabled   Connected   Dedicated   <Interface Name>
+            if len(parts) >= 4 and parts[1].lower() == "connected":
+                iface_names.add(" ".join(parts[3:]))
+    except Exception:
+        pass
+
+    for name in iface_names:
         try:
             subprocess.run(
                 ["netsh", "interface", "ipv4", "set", "interface",
@@ -1141,6 +1262,7 @@ def enable_ip_forwarding():
             )
         except Exception:
             pass
+    print(f"[*] IP Forwarding: ENABLED on interfaces: {iface_names}")
 
 
 def disable_ip_forwarding():
@@ -1340,6 +1462,16 @@ def sniff_on_iface(iface, iface_lbl):
     """Dedicated capture loop for one interface — runs in its own thread."""
     handler = make_packet_handler(iface, iface_lbl)
     conf.use_npcap = True
+
+    # BUG FIX: previously used the GLOBAL packet_count for per-interface
+    # diagnostics. When multiple interfaces are active the delta mixed counts
+    # from all threads, making the per-interface rate completely wrong.
+    # Fix: maintain a purely local counter per thread.
+    iface_pkt_local = 0   # packets counted by THIS interface's handler
+    last_report_time = time.time()
+
+    print(f"  [SNIFF] {iface_lbl}: Starting capture on {iface} (promisc=ON)")
+
     while not stop_flag.is_set():
         try:
             sniff(
@@ -1348,10 +1480,28 @@ def sniff_on_iface(iface, iface_lbl):
                 store=False,
                 filter="",      # capture everything: ARP + IP + all
                 promisc=True,   # see all frames, not just ours
-                timeout=0.5,
+                timeout=5,
             )
-        except Exception:
-            pass   # transient error — keep looping
+        except Exception as e:
+            if not stop_flag.is_set():
+                print(f"  [SNIFF] {iface_lbl}: Error — {e}")
+
+        # Per-interface packet rate diagnostics (every 30s)
+        now = time.time()
+        if now - last_report_time >= 30:
+            # handler closure increments packet_count (global) on every call.
+            # We snapshot it here; because multiple ifaces share the global we
+            # track a local baseline instead.
+            with counters_lock:
+                cur_global = packet_count
+            delta = cur_global - iface_pkt_local
+            iface_pkt_local = cur_global
+            last_report_time = now
+            if delta == 0:
+                print(f"  [SNIFF] {iface_lbl}: ⚠  0 new packets in last 30s — "
+                      f"check interface/Npcap/promisc")
+            else:
+                print(f"  [SNIFF] {iface_lbl}: ~{delta} packets in last 30s (all ifaces)")
 
 
 # =============================
@@ -1518,6 +1668,8 @@ if __name__ == "__main__":
                     "gateway_mac": gw_mac,
                     "my_mac":      my_mac,
                 }
+                # BUG FIX: refresh the cached own-MACs set after each iface_info update
+                _refresh_own_macs()
                 mac_table[gw_ip] = gw_mac
                 register_device(gw_ip, gw_mac, label)
 

@@ -16,9 +16,8 @@ venv.bak/
 .env.local
 secrets.py
 
-# Data and Models
+# Data (raw dataset too large for git)
 data/
-models/*.pkl
 
 # PCAP files
 *.pcap

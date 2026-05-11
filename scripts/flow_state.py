@@ -1,5 +1,6 @@
 import time
 import numpy as np
+from scapy.layers.inet import IP, TCP, UDP  # use proper layer classes, not strings
 
 
 class FlowState:
@@ -39,17 +40,25 @@ class FlowState:
 
         self.fwd_act_data_pkts = 0
 
-        # Flags
+        # Flags  (RFC 793 + RFC 3168)
+        # Bit positions: FIN=0x01, SYN=0x02, RST=0x04, PSH=0x08,
+        #                ACK=0x10, URG=0x20, ECE=0x40, CWR=0x80
         self.fin_flag_cnt = 0
         self.syn_flag_cnt = 0
         self.rst_flag_cnt = 0
         self.psh_flag_cnt = 0
         self.ack_flag_cnt = 0
         self.urg_flag_cnt = 0
-        self.cwe_flag_cnt = 0
-        self.ece_flag_cnt = 0
+        self.ece_flag_cnt = 0   # ECE = 0x40
+        self.cwr_flag_cnt = 0   # CWR = 0x80  (was "cwe" — typo fixed)
 
-        # 🔥 NEW BEHAVIOR FEATURES
+        # BUG FIX: fwd_ip must be initialised to None before update() is called.
+        # Previously it was only set inside update() when tot_fwd_pkts==0, but if
+        # the first packet had no IP layer update() returned early, leaving fwd_ip
+        # undefined and causing AttributeError on the next packet.
+        self.fwd_ip = None
+
+        # Behaviour features
         self.unique_dst_ports = set()
         self.total_packets = 0
         self.total_bytes = 0
@@ -78,12 +87,16 @@ class FlowState:
         self.all_pkt_lengths.append(pkt_len)
         self.timestamps.append(now)
 
-        if "IP" not in packet:          # safety guard: should never happen, but just in case
+        # BUG FIX: use Scapy layer class (IP), not string "IP".
+        # `"IP" not in packet` checks the string in packet fields (wrong);
+        # `IP not in packet`  checks for the IP layer   (correct).
+        if IP not in packet:
             return
 
-        src_ip = packet["IP"].src
+        src_ip = packet[IP].src
 
-        if self.tot_fwd_pkts == 0:
+        # BUG FIX: fwd_ip initialised in __init__ so this is always safe.
+        if self.fwd_ip is None:
             self.fwd_ip = src_ip
 
         is_forward = (src_ip == self.fwd_ip)
@@ -99,9 +112,9 @@ class FlowState:
             self.bwd_pkt_lengths.append(pkt_len)
             self.bwd_timestamps.append(now)
 
-        if "TCP" in packet:
+        if TCP in packet:
 
-            tcp = packet["TCP"]
+            tcp = packet[TCP]
 
             self.unique_dst_ports.add(tcp.dport)
 
@@ -118,8 +131,9 @@ class FlowState:
                 if self.tot_bwd_pkts == 1:
                     self.init_bwd_win_bytes = tcp.window
 
-            flags = tcp.flags
+            flags = int(tcp.flags)
 
+            # BUG FIX: ECE=0x40, CWR=0x80 (corrected from "cwe" typo)
             if flags & 0x01: self.fin_flag_cnt += 1
             if flags & 0x02: self.syn_flag_cnt += 1
             if flags & 0x04: self.rst_flag_cnt += 1
@@ -127,11 +141,11 @@ class FlowState:
             if flags & 0x10: self.ack_flag_cnt += 1
             if flags & 0x20: self.urg_flag_cnt += 1
             if flags & 0x40: self.ece_flag_cnt += 1
-            if flags & 0x80: self.cwe_flag_cnt += 1
+            if flags & 0x80: self.cwr_flag_cnt += 1
 
-        elif "UDP" in packet:
+        elif UDP in packet:
 
-            udp = packet["UDP"]
+            udp = packet[UDP]
             self.unique_dst_ports.add(udp.dport)
 
     def flow_duration(self):
@@ -160,25 +174,25 @@ class FlowState:
         fwd_max, fwd_min, fwd_mean, fwd_std = stats(self.fwd_pkt_lengths)
         bwd_max, bwd_min, bwd_mean, bwd_std = stats(self.bwd_pkt_lengths)
 
-        pkt_min = np.min(self.all_pkt_lengths) if self.all_pkt_lengths else 0
-        pkt_max = np.max(self.all_pkt_lengths) if self.all_pkt_lengths else 0
-        pkt_mean = np.mean(self.all_pkt_lengths) if self.all_pkt_lengths else 0
-        pkt_std = np.std(self.all_pkt_lengths) if self.all_pkt_lengths else 0
-        pkt_var = np.var(self.all_pkt_lengths) if self.all_pkt_lengths else 0
+        pkt_min  = float(np.min(self.all_pkt_lengths))  if self.all_pkt_lengths else 0
+        pkt_max  = float(np.max(self.all_pkt_lengths))  if self.all_pkt_lengths else 0
+        pkt_mean = float(np.mean(self.all_pkt_lengths)) if self.all_pkt_lengths else 0
+        pkt_std  = float(np.std(self.all_pkt_lengths))  if self.all_pkt_lengths else 0
+        pkt_var  = float(np.var(self.all_pkt_lengths))  if self.all_pkt_lengths else 0
 
         flow_iat_mean, flow_iat_std, flow_iat_max, flow_iat_min, _ = self.compute_iat_stats(self.timestamps)
-        fwd_iat_mean, fwd_iat_std, fwd_iat_max, fwd_iat_min, fwd_iat_tot = self.compute_iat_stats(self.fwd_timestamps)
-        bwd_iat_mean, bwd_iat_std, bwd_iat_max, bwd_iat_min, bwd_iat_tot = self.compute_iat_stats(self.bwd_timestamps)
+        fwd_iat_mean,  fwd_iat_std,  fwd_iat_max,  fwd_iat_min,  fwd_iat_tot  = self.compute_iat_stats(self.fwd_timestamps)
+        bwd_iat_mean,  bwd_iat_std,  bwd_iat_max,  bwd_iat_min,  bwd_iat_tot  = self.compute_iat_stats(self.bwd_timestamps)
 
         active_mean, active_std, active_max, active_min = self.compute_stats(self.active_times)
-        idle_mean, idle_std, idle_max, idle_min = self.compute_stats(self.idle_times)
+        idle_mean,   idle_std,   idle_max,   idle_min   = self.compute_stats(self.idle_times)
 
         down_up_ratio = self.tot_bwd_pkts / self.tot_fwd_pkts if self.tot_fwd_pkts > 0 else 0
 
         features = {
 
-            "Dst Port": self.dst_port,
-            "Protocol": self.protocol,
+            "Dst Port":      self.dst_port,
+            "Protocol":      self.protocol,
             "Flow Duration": duration * 1e6,
 
             "Tot Fwd Pkts": self.tot_fwd_pkts,
@@ -188,8 +202,8 @@ class FlowState:
             "TotLen Bwd Pkts": self.totlen_bwd_pkts,
 
             "Unique Dst Ports": len(self.unique_dst_ports),
-            "Total Packets": self.total_packets,
-            "Total Bytes": self.total_bytes,
+            "Total Packets":    self.total_packets,
+            "Total Bytes":      self.total_bytes,
 
             "SYN Rate": self.syn_flag_cnt / duration,
             "RST Rate": self.rst_flag_cnt / duration,
@@ -209,52 +223,53 @@ class FlowState:
 
             "Fwd Act Data Pkts": self.fwd_act_data_pkts,
 
-            "Fwd Pkt Len Max": fwd_max,
-            "Fwd Pkt Len Min": fwd_min,
+            "Fwd Pkt Len Max":  fwd_max,
+            "Fwd Pkt Len Min":  fwd_min,
             "Fwd Pkt Len Mean": fwd_mean,
-            "Fwd Pkt Len Std": fwd_std,
+            "Fwd Pkt Len Std":  fwd_std,
 
-            "Bwd Pkt Len Max": bwd_max,
-            "Bwd Pkt Len Min": bwd_min,
+            "Bwd Pkt Len Max":  bwd_max,
+            "Bwd Pkt Len Min":  bwd_min,
             "Bwd Pkt Len Mean": bwd_mean,
-            "Bwd Pkt Len Std": bwd_std,
+            "Bwd Pkt Len Std":  bwd_std,
 
-            "Pkt Len Min": pkt_min,
-            "Pkt Len Max": pkt_max,
+            "Pkt Len Min":  pkt_min,
+            "Pkt Len Max":  pkt_max,
             "Pkt Len Mean": pkt_mean,
-            "Pkt Len Std": pkt_std,
-            "Pkt Len Var": pkt_var,
+            "Pkt Len Std":  pkt_std,
+            "Pkt Len Var":  pkt_var,
 
             "Flow Byts/s": (self.totlen_fwd_pkts + self.totlen_bwd_pkts) / duration,
-            "Flow Pkts/s": (self.tot_fwd_pkts + self.tot_bwd_pkts) / duration,
-            "Fwd Pkts/s": self.tot_fwd_pkts / duration,
-            "Bwd Pkts/s": self.tot_bwd_pkts / duration,
+            "Flow Pkts/s": (self.tot_fwd_pkts    + self.tot_bwd_pkts)    / duration,
+            "Fwd Pkts/s":   self.tot_fwd_pkts / duration,
+            "Bwd Pkts/s":   self.tot_bwd_pkts / duration,
 
             "Flow IAT Mean": flow_iat_mean * 1e6,
-            "Flow IAT Std": flow_iat_std * 1e6,
-            "Flow IAT Max": flow_iat_max * 1e6,
-            "Flow IAT Min": flow_iat_min * 1e6,
+            "Flow IAT Std":  flow_iat_std  * 1e6,
+            "Flow IAT Max":  flow_iat_max  * 1e6,
+            "Flow IAT Min":  flow_iat_min  * 1e6,
 
-            "Fwd IAT Tot": fwd_iat_tot * 1e6,
+            "Fwd IAT Tot":  fwd_iat_tot  * 1e6,
             "Fwd IAT Mean": fwd_iat_mean * 1e6,
-            "Fwd IAT Std": fwd_iat_std * 1e6,
-            "Fwd IAT Max": fwd_iat_max * 1e6,
-            "Fwd IAT Min": fwd_iat_min * 1e6,
+            "Fwd IAT Std":  fwd_iat_std  * 1e6,
+            "Fwd IAT Max":  fwd_iat_max  * 1e6,
+            "Fwd IAT Min":  fwd_iat_min  * 1e6,
 
-            "Bwd IAT Tot": bwd_iat_tot * 1e6,
+            "Bwd IAT Tot":  bwd_iat_tot  * 1e6,
             "Bwd IAT Mean": bwd_iat_mean * 1e6,
-            "Bwd IAT Std": bwd_iat_std * 1e6,
-            "Bwd IAT Max": bwd_iat_max * 1e6,
-            "Bwd IAT Min": bwd_iat_min * 1e6,
+            "Bwd IAT Std":  bwd_iat_std  * 1e6,
+            "Bwd IAT Max":  bwd_iat_max  * 1e6,
+            "Bwd IAT Min":  bwd_iat_min  * 1e6,
 
-            "FIN Flag Cnt": self.fin_flag_cnt,
-            "SYN Flag Cnt": self.syn_flag_cnt,
-            "RST Flag Cnt": self.rst_flag_cnt,
-            "PSH Flag Cnt": self.psh_flag_cnt,
-            "ACK Flag Cnt": self.ack_flag_cnt,
-            "URG Flag Cnt": self.urg_flag_cnt,
-            "CWE Flag Count": self.cwe_flag_cnt,
-            "ECE Flag Cnt": self.ece_flag_cnt,
+            "FIN Flag Cnt":   self.fin_flag_cnt,
+            "SYN Flag Cnt":   self.syn_flag_cnt,
+            "RST Flag Cnt":   self.rst_flag_cnt,
+            "PSH Flag Cnt":   self.psh_flag_cnt,
+            "ACK Flag Cnt":   self.ack_flag_cnt,
+            "URG Flag Cnt":   self.urg_flag_cnt,
+            # BUG FIX: was "CWE Flag Count" (wrong name). CWR = Congestion Window Reduced.
+            "CWE Flag Count": self.cwr_flag_cnt,   # keep key name for model compat
+            "ECE Flag Cnt":   self.ece_flag_cnt,
 
             "Subflow Fwd Pkts": self.tot_fwd_pkts,
             "Subflow Fwd Byts": self.totlen_fwd_pkts,
@@ -262,14 +277,14 @@ class FlowState:
             "Subflow Bwd Byts": self.totlen_bwd_pkts,
 
             "Active Mean": active_mean * 1e6,
-            "Active Std": active_std * 1e6,
-            "Active Max": active_max * 1e6,
-            "Active Min": active_min * 1e6,
+            "Active Std":  active_std  * 1e6,
+            "Active Max":  active_max  * 1e6,
+            "Active Min":  active_min  * 1e6,
 
             "Idle Mean": idle_mean * 1e6,
-            "Idle Std": idle_std * 1e6,
-            "Idle Max": idle_max * 1e6,
-            "Idle Min": idle_min * 1e6,
+            "Idle Std":  idle_std  * 1e6,
+            "Idle Max":  idle_max  * 1e6,
+            "Idle Min":  idle_min  * 1e6,
         }
 
         return features
