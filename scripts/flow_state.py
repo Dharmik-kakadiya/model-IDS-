@@ -52,6 +52,12 @@ class FlowState:
         self.ece_flag_cnt = 0   # ECE = 0x40
         self.cwr_flag_cnt = 0   # CWR = 0x80  (was "cwe" — typo fixed)
 
+        # Direction-specific PSH/URG flag counts (needed by model)
+        self.fwd_psh_flag_cnt = 0
+        self.bwd_psh_flag_cnt = 0
+        self.fwd_urg_flag_cnt = 0
+        self.bwd_urg_flag_cnt = 0
+
         # BUG FIX: fwd_ip must be initialised to None before update() is called.
         # Previously it was only set inside update() when tot_fwd_pkts==0, but if
         # the first packet had no IP layer update() returned early, leaving fwd_ip
@@ -118,7 +124,10 @@ class FlowState:
 
             self.unique_dst_ports.add(tcp.dport)
 
-            header_len = tcp.dataofs * 4
+            # BUG FIX: tcp.dataofs can be None for truncated/malformed packets
+            # causing TypeError: unsupported operand type(s) for *: 'NoneType' and 'int'
+            # Fix: fall back to standard 5 (20-byte TCP header) when None.
+            header_len = (tcp.dataofs or 5) * 4
 
             if is_forward:
                 self.fwd_header_len += header_len
@@ -137,9 +146,15 @@ class FlowState:
             if flags & 0x01: self.fin_flag_cnt += 1
             if flags & 0x02: self.syn_flag_cnt += 1
             if flags & 0x04: self.rst_flag_cnt += 1
-            if flags & 0x08: self.psh_flag_cnt += 1
+            if flags & 0x08:
+                self.psh_flag_cnt += 1
+                if is_forward: self.fwd_psh_flag_cnt += 1
+                else:          self.bwd_psh_flag_cnt += 1
             if flags & 0x10: self.ack_flag_cnt += 1
-            if flags & 0x20: self.urg_flag_cnt += 1
+            if flags & 0x20:
+                self.urg_flag_cnt += 1
+                if is_forward: self.fwd_urg_flag_cnt += 1
+                else:          self.bwd_urg_flag_cnt += 1
             if flags & 0x40: self.ece_flag_cnt += 1
             if flags & 0x80: self.cwr_flag_cnt += 1
 
@@ -189,6 +204,10 @@ class FlowState:
 
         down_up_ratio = self.tot_bwd_pkts / self.tot_fwd_pkts if self.tot_fwd_pkts > 0 else 0
 
+        total_len = self.totlen_fwd_pkts + self.totlen_bwd_pkts
+        total_pkts = self.tot_fwd_pkts + self.tot_bwd_pkts
+        pkt_size_avg = total_len / total_pkts if total_pkts > 0 else 0
+
         features = {
 
             "Dst Port":      self.dst_port,
@@ -201,18 +220,28 @@ class FlowState:
             "TotLen Fwd Pkts": self.totlen_fwd_pkts,
             "TotLen Bwd Pkts": self.totlen_bwd_pkts,
 
-            "Unique Dst Ports": len(self.unique_dst_ports),
-            "Total Packets":    self.total_packets,
-            "Total Bytes":      self.total_bytes,
-
-            "SYN Rate": self.syn_flag_cnt / duration,
-            "RST Rate": self.rst_flag_cnt / duration,
-            "ACK Rate": self.ack_flag_cnt / duration,
-
             "Fwd Header Len": self.fwd_header_len,
             "Bwd Header Len": self.bwd_header_len,
 
             "Down/Up Ratio": down_up_ratio,
+
+            # Direction-specific PSH/URG flag counts
+            "Fwd PSH Flags": self.fwd_psh_flag_cnt,
+            "Bwd PSH Flags": self.bwd_psh_flag_cnt,
+            "Fwd URG Flags": self.fwd_urg_flag_cnt,
+            "Bwd URG Flags": self.bwd_urg_flag_cnt,
+
+            # Average packet size across all packets in flow
+            "Pkt Size Avg": pkt_size_avg,
+
+            # Bulk rate features — require L7 segmentation, set to 0
+            # (model trained with these as 0 for most flows too)
+            "Fwd Byts/b Avg":   0,
+            "Fwd Pkts/b Avg":   0,
+            "Fwd Blk Rate Avg": 0,
+            "Bwd Byts/b Avg":   0,
+            "Bwd Pkts/b Avg":   0,
+            "Bwd Blk Rate Avg": 0,
 
             "Fwd Seg Size Avg": fwd_mean,
             "Bwd Seg Size Avg": bwd_mean,

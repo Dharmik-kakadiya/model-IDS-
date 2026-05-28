@@ -525,6 +525,7 @@ def iface_tag_str(iface_lbl):
 
 # BUG FIX: cap hostname_cache size to prevent unbounded memory growth.
 # After 2000 entries, evict the 500 oldest.
+# IMPORTANT: These must be defined BEFORE parse_dns_response() which uses them.
 _CACHE_MAX = 2000
 _CACHE_EVICT = 500
 
@@ -639,8 +640,31 @@ def register_device(ip, mac, iface_label=""):
 # =============================
 
 def prediction_worker():
-    """Background thread — runs ML predictions without blocking capture."""
-    while True:
+    """Background thread — runs ML predictions without blocking capture.
+
+    BUG FIX: Previously the outer while-loop had no protection against
+    unexpected exceptions escaping the inner try/except (e.g. MemoryError,
+    KeyboardInterrupt propagated from main thread, or rare numpy/sklearn
+    internal errors).  If prediction_worker() returned or raised, the thread
+    died silently and ALL output stopped — the program appeared to "freeze".
+
+    Fix: wrap the entire body in an outer restart loop. If an unhandled
+    exception occurs, print it and restart after a short delay rather than
+    letting the thread die.
+    """
+    while not stop_flag.is_set():
+        try:
+            _prediction_worker_inner()
+        except Exception as e:
+            if not stop_flag.is_set():
+                print(f"[prediction_worker] Unexpected crash — restarting: {e}")
+                import traceback; traceback.print_exc()
+                time.sleep(1)   # brief pause before restart
+
+
+def _prediction_worker_inner():
+    """Core prediction loop — called by prediction_worker()."""
+    while not stop_flag.is_set():
         try:
             item = prediction_queue.get(timeout=1)
         except Empty:
@@ -1118,6 +1142,78 @@ def spoof_target(target_ip, target_mac, spoof_ip, my_mac, iface):
             _spoof_sockets.pop(iface, None)
 
 
+def _setup_iface_spoof(iface, local_ip, label, subnet, gw_ip, gw_mac, my_mac):
+    """
+    Register gateway, store iface_info, refresh MACs, start ARP spoof thread.
+    Called once GW MAC is known — either at startup or by the retry loop.
+    """
+    with flows_lock:   # reuse any lock; just need serialization
+        if iface in iface_info:
+            return   # already set up (retry loop raced with startup)
+
+    iface_info[iface] = {
+        "label":       label,
+        "local_ip":    local_ip,
+        "subnet":      subnet,
+        "gateway_ip":  gw_ip,
+        "gateway_mac": gw_mac,
+        "my_mac":      my_mac,
+    }
+    _refresh_own_macs()
+    mac_table[gw_ip] = gw_mac
+    register_device(gw_ip, gw_mac, label)
+
+    threading.Thread(
+        target=arp_spoof_loop_for_iface,
+        args=(iface, iface_info[iface]),
+        daemon=True,
+        name=f"spoof-{label}"
+    ).start()
+    print(f"  [ARP SPOOF] {label}: Started — Gateway {gw_ip} ({gw_mac})")
+
+
+def gw_mac_retry_loop(iface, local_ip, label, subnet, gw_ip, my_mac,
+                      retry_interval=15, max_retries=40):
+    """
+    Background thread: keeps retrying to resolve gateway MAC for an interface.
+
+    Problem solved:
+    At startup, the Ethernet gateway may not respond to ARP (cable just
+    plugged in, router still booting, or our ARP request races with DHCP).
+    The original code tried ONCE and skipped ARP spoof permanently if it
+    failed — Ethernet would sniff traffic but NEVER intercept other devices.
+
+    Fix: This loop retries every `retry_interval` seconds (default 15s) up
+    to `max_retries` times. The moment GW MAC is found, it calls
+    _setup_iface_spoof() to start ARP spoofing and then exits.
+    Also enables IP forwarding if it hasn't been enabled yet.
+    """
+    attempt = 0
+    while not stop_flag.is_set() and attempt < max_retries:
+        attempt += 1
+        if iface in iface_info:
+            return   # already set up by another path
+
+        stop_flag.wait(retry_interval)
+        if stop_flag.is_set():
+            return
+
+        gw_mac = get_mac_for_ip(gw_ip, iface, own_mac=my_mac)
+        if gw_mac:
+            print(f"[*] {label}: Gateway MAC found on attempt {attempt} — {gw_ip} ({gw_mac})")
+            _setup_iface_spoof(iface, local_ip, label, subnet, gw_ip, gw_mac, my_mac)
+            # Enable IP forwarding if this is the first interface to get a spoof
+            if ARP_SPOOF_ENABLED and iface_info and len(iface_info) == 1:
+                enable_ip_forwarding()
+            return
+        else:
+            print(f"  [ARP RETRY] {label}: GW MAC still not found (attempt {attempt}/{max_retries})")
+
+    if attempt >= max_retries:
+        print(f"  [ARP RETRY] {label}: Giving up after {max_retries} attempts — "
+              f"ARP spoof disabled for this interface")
+
+
 def restore_arp(target_ip, target_mac, real_ip, real_mac, iface):
     """Restore real ARP mappings on exit (sent 5× for reliability)."""
     try:
@@ -1459,16 +1555,34 @@ def health_monitor():
 # =============================
 
 def sniff_on_iface(iface, iface_lbl):
-    """Dedicated capture loop for one interface — runs in its own thread."""
-    handler = make_packet_handler(iface, iface_lbl)
-    conf.use_npcap = True
+    """Dedicated capture loop for one interface — runs in its own thread.
 
-    # BUG FIX: previously used the GLOBAL packet_count for per-interface
-    # diagnostics. When multiple interfaces are active the delta mixed counts
-    # from all threads, making the per-interface rate completely wrong.
-    # Fix: maintain a purely local counter per thread.
-    iface_pkt_local = 0   # packets counted by THIS interface's handler
+    BUG FIX: Per-interface packet counter was using the shared global
+    packet_count. When two interfaces are active, the delta between snapshots
+    includes packets from the OTHER interface too, making the zero-packet
+    warning fire incorrectly and causing confusing diagnostics.
+    Fix: use a closure counter (_local_pkt_count) incremented inside the
+    handler itself — each interface handler only increments its own counter.
+
+    BUG FIX: On Windows/Npcap, a sniff() call can raise OSError or
+    ChildProcessError if the interface is temporarily unavailable (e.g. DHCP
+    renewal, brief disconnect, power-save mode). The original code printed the
+    error and immediately retried — on repeated failures this spammed the log
+    at full speed. Fix: add exponential backoff (up to 30s) on repeated errors.
+    """
+    # Per-interface packet counter — NOT the shared global.
+    _local_pkt_count = [0]   # list so it's mutable inside the closure
+
+    base_handler = make_packet_handler(iface, iface_lbl)
+
+    def counting_handler(pkt):
+        _local_pkt_count[0] += 1
+        base_handler(pkt)
+
+    conf.use_npcap = True
     last_report_time = time.time()
+    last_local_snap  = 0
+    err_count        = 0    # consecutive error counter for backoff
 
     print(f"  [SNIFF] {iface_lbl}: Starting capture on {iface} (promisc=ON)")
 
@@ -1476,26 +1590,28 @@ def sniff_on_iface(iface, iface_lbl):
         try:
             sniff(
                 iface=iface,
-                prn=handler,
+                prn=counting_handler,
                 store=False,
                 filter="",      # capture everything: ARP + IP + all
                 promisc=True,   # see all frames, not just ours
                 timeout=5,
             )
+            err_count = 0   # reset backoff on success
         except Exception as e:
-            if not stop_flag.is_set():
-                print(f"  [SNIFF] {iface_lbl}: Error — {e}")
+            if stop_flag.is_set():
+                break
+            err_count += 1
+            wait = min(2 ** err_count, 30)   # 2, 4, 8, 16, 30s max
+            print(f"  [SNIFF] {iface_lbl}: Error ({err_count}x) — {e}  (retrying in {wait}s)")
+            stop_flag.wait(wait)
+            continue
 
         # Per-interface packet rate diagnostics (every 30s)
         now = time.time()
         if now - last_report_time >= 30:
-            # handler closure increments packet_count (global) on every call.
-            # We snapshot it here; because multiple ifaces share the global we
-            # track a local baseline instead.
-            with counters_lock:
-                cur_global = packet_count
-            delta = cur_global - iface_pkt_local
-            iface_pkt_local = cur_global
+            cur_local = _local_pkt_count[0]
+            delta     = cur_local - last_local_snap
+            last_local_snap  = cur_local
             last_report_time = now
             if delta == 0:
                 print(f"  [SNIFF] {iface_lbl}: ⚠  0 new packets in last 30s — "
@@ -1596,6 +1712,85 @@ def print_device_summary():
 
 
 # =============================
+# INTERFACE PRE-CHECK
+# =============================
+
+def print_interface_precheck(active_ifaces):
+    """
+    Startup pe detailed interface check print karo:
+      - Type    : WiFi ya Ethernet
+      - IP      : Is machine ka IP is interface pe
+      - MAC     : Is machine ka MAC address
+      - Gateway : Gateway IP (router)
+      - Subnet  : /24 subnet range
+      - Status  : Gateway ping se check
+
+    Ye table monitoring start hone se PEHLE print hoti hai taaki
+    user confirm kar sake ki correct interfaces detect hue hain.
+    """
+    print()
+    print("=" * 105)
+    print("  INTERFACE PRE-CHECK — Monitoring shuru hone se pehle verify karo")
+    print("=" * 105)
+    print(f"  {'#':<3} {'Type':<8} {'Label':<11} {'IP Address':<16} "
+          f"{'My MAC':<19} {'Gateway':<16} {'Subnet':<18} Status")
+    print("  " + "-" * 101)
+
+    all_ok = True
+    for idx, (iface, local_ip, label) in enumerate(active_ifaces, 1):
+        # Detect type
+        lbl_lower = label.lower()
+        if any(k in lbl_lower for k in ("wi-fi", "wifi", "wireless", "wlan")):
+            iface_type = "[WiFi]"
+        else:
+            iface_type = "[ ETH]"
+
+        # My MAC on this interface
+        my_mac = get_own_mac_safe(iface) or "??:??:??:??:??:??"
+
+        # Gateway IP for this interface
+        try:
+            gw_ip = get_gateway_ip_for_iface(iface, local_ip)
+        except Exception:
+            gw_ip = "?"
+
+        # Subnet
+        subnet_info = get_local_subnet(iface)
+        subnet = subnet_info[0] if subnet_info else "?"
+
+        # Status — ping gateway to check if reachable
+        if gw_ip and gw_ip != "?":
+            try:
+                result = subprocess.run(
+                    ["ping", "-n", "1", "-w", "800", gw_ip],
+                    capture_output=True, timeout=3
+                )
+                if result.returncode == 0:
+                    status = "OK"
+                else:
+                    status = "WARN: Gateway not responding"
+                    all_ok = False
+            except Exception:
+                status = "WARN: Ping failed"
+                all_ok = False
+        else:
+            status = "WARN: No gateway detected"
+            all_ok = False
+
+        print(f"  {idx:<3} {iface_type:<8} {label:<11} {local_ip:<16} "
+              f"{my_mac:<19} {gw_ip:<16} {subnet:<18} {status}")
+
+    print("  " + "-" * 101)
+    print(f"  Total  : {len(active_ifaces)} interface(s) detected")
+    if not all_ok:
+        print("  NOTE   : ⚠ wali interfaces pe ARP spoof background mein "
+              "automatically retry karega jab gateway milega")
+    print("=" * 105)
+    print()
+
+
+
+# =============================
 # MAIN — START IDS
 # =============================
 
@@ -1609,10 +1804,8 @@ if __name__ == "__main__":
         print("        Make sure you are connected to WiFi or Ethernet.")
         sys.exit(1)
 
-    print(f"\n[*] Found {len(active_ifaces)} active interface(s):\n")
-    for iface, ip, label in active_ifaces:
-        print(f"    {iface_tag_str(label)}  {label:<10} IP: {ip:<16}  NPF: {iface}")
-    print()
+    print(f"\n[*] Found {len(active_ifaces)} active interface(s) — running pre-check ...\n")
+    print_interface_precheck(active_ifaces)
 
     print(f"[*] Mode        : {'Device-Only' if DEVICE_ONLY_MODE else 'FULL NETWORK — ALL devices'}")
     print(f"[*] ARP Spoof   : {'ON — forces all LAN traffic through this machine' if ARP_SPOOF_ENABLED else 'OFF'}")
@@ -1660,26 +1853,23 @@ if __name__ == "__main__":
             print(f"[*] {label}: Gateway={gw_ip}  GW_MAC={gw_mac}  My_MAC={my_mac}")
 
             if gw_mac and my_mac:
-                iface_info[iface] = {
-                    "label":       label,
-                    "local_ip":    local_ip,
-                    "subnet":      subnet,
-                    "gateway_ip":  gw_ip,
-                    "gateway_mac": gw_mac,
-                    "my_mac":      my_mac,
-                }
-                # BUG FIX: refresh the cached own-MACs set after each iface_info update
-                _refresh_own_macs()
-                mac_table[gw_ip] = gw_mac
-                register_device(gw_ip, gw_mac, label)
-
+                # GW MAC found immediately — set up ARP spoof now
+                _setup_iface_spoof(iface, local_ip, label, subnet, gw_ip, gw_mac, my_mac)
+            elif my_mac:
+                # GW MAC not found yet (router slow / Ethernet just connected).
+                # Start background retry loop — it will start ARP spoof once
+                # the gateway becomes reachable (up to 40 × 15s = 10 minutes).
+                print(f"  [!] {label}: Gateway MAC not found at startup — "
+                      f"retrying in background every 15s ...")
                 threading.Thread(
-                    target=arp_spoof_loop_for_iface,
-                    args=(iface, iface_info[iface]),
-                    daemon=True
+                    target=gw_mac_retry_loop,
+                    args=(iface, local_ip, label, subnet, gw_ip, my_mac),
+                    daemon=True,
+                    name=f"gw-retry-{label}"
                 ).start()
             else:
-                print(f"[!] {label}: Gateway MAC not found — ARP spoof skipped")
+                print(f"  [!] {label}: Cannot get own MAC — ARP spoof skipped entirely")
+
 
     if ARP_SPOOF_ENABLED and iface_info:
         enable_ip_forwarding()

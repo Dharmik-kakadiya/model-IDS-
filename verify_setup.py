@@ -164,11 +164,21 @@ files_to_check = {
 
 for label, (path, min_bytes) in files_to_check.items():
     if path.exists():
-        size_kb = path.stat().st_size / 1024
+        size = path.stat().st_size
+        size_kb = size / 1024
         size_mb = size_kb / 1024
         size_str = f"{size_mb:.1f} MB" if size_mb >= 1 else f"{size_kb:.1f} KB"
+        
+        if label == "network_model.pkl" and size < 1024:
+            err(f"{label:<22}  Git LFS Error! File is only {size} bytes.")
+            err(f"{' ':>24}  You downloaded a GitHub ZIP which lacks the real 187MB file.")
+            err(f"{' ':>24}  This causes 'KeyError 118' when running the script.")
+            err(f"{' ':>24}  Fix: Download the raw network_model.pkl directly from GitHub.")
+            FAIL += 1
+            continue
+
         check(
-            path.stat().st_size >= min_bytes,
+            size >= min_bytes,
             f"{label:<22}  Found  ({size_str})",
             f"{label:<22}  File exists but seems too small ({size_str}) — may be corrupted",
             is_warning=True,
